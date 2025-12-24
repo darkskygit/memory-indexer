@@ -4,8 +4,8 @@ use super::{
     pipeline::{DefaultTokenizer, Pipeline},
     tokenizer::Token,
     types::{
-        DocData, DomainLengths, DomainSnapshot, InMemoryIndex, PipelineToken, PositionEncoding,
-        SNAPSHOT_VERSION, SnapshotData, TermDomain, TokenStream,
+        DocData, DomainLengths, InMemoryIndex, PipelineToken, PositionEncoding, SNAPSHOT_VERSION,
+        SnapshotData, TermDomain, TokenStream,
     },
 };
 
@@ -248,8 +248,13 @@ impl InMemoryIndex {
         self.get_matches_for_terms(index_name, doc_id, &term_strings)
     }
 
-    /// Load a snapshot into an index, rebuilding missing auxiliary structures if needed.
+    /// Load a snapshot into an index, expecting all auxiliary structures to be present.
     pub fn load_snapshot(&mut self, index_name: &str, snapshot: SnapshotData) {
+        assert_eq!(
+            snapshot.version, SNAPSHOT_VERSION,
+            "snapshot version {} does not match expected {}",
+            snapshot.version, SNAPSHOT_VERSION
+        );
         let version = {
             let mut maps = self.index_maps_mut(index_name);
             maps.clear(false);
@@ -262,26 +267,17 @@ impl InMemoryIndex {
     /// Get a serializable snapshot of the given index, including aux dictionaries/ngrams.
     pub fn get_snapshot_data(&self, index_name: &str) -> Option<SnapshotData> {
         self.docs.get(index_name).map(|docs| {
-            let domains = self
-                .domains
-                .get(index_name)
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(domain, data)| {
-                    (
-                        domain,
-                        DomainSnapshot {
-                            term_dict: data.term_dict,
-                            ngram_index: data.ngram_index,
-                        },
-                    )
-                })
-                .collect();
+            let domains = self.domains.get(index_name).cloned().unwrap_or_default();
 
             SnapshotData {
                 version: *self.versions.get(index_name).unwrap_or(&SNAPSHOT_VERSION),
                 docs: docs.clone(),
+                total_len: *self.total_lens.get(index_name).unwrap_or(&0),
+                domain_total_len: self
+                    .domain_total_lens
+                    .get(index_name)
+                    .cloned()
+                    .unwrap_or_default(),
                 domains,
             }
         })

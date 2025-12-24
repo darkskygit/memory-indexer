@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use super::tokenizer::{DictionaryConfig, OffsetMap, SegmentScript, TokenWithScript};
 
-pub const SNAPSHOT_VERSION: u32 = 3;
+pub const SNAPSHOT_VERSION: u32 = 4;
 
 /// Search execution strategy for a query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,20 +222,15 @@ pub struct TokenStream {
 }
 
 /// Snapshot of per-domain auxiliary structures.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct DomainSnapshot {
-    pub term_dict: HashSet<String>,
-    pub ngram_index: HashMap<String, Vec<String>>,
-}
-
 /// Persisted index state including documents and aux domain data.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SnapshotData {
     #[serde(default)]
     pub version: u32,
     pub docs: HashMap<String, DocData>,
-    #[serde(default)]
-    pub domains: HashMap<TermDomain, DomainSnapshot>,
+    pub domains: HashMap<TermDomain, DomainIndex>,
+    pub total_len: i64,
+    pub domain_total_len: DomainLengths,
 }
 
 /// Term and domain that matched during search.

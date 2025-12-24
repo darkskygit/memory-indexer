@@ -18,9 +18,9 @@ pub use tokenizer::dictionary::{
 
 #[cfg(test)]
 mod tests {
-    use super::types::{DomainLengths, MatchedTerm, TermFrequency};
+    use super::types::MatchedTerm;
     use super::*;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashSet;
     use tempfile::tempdir;
 
     const INDEX: &str = "test-index";
@@ -628,21 +628,15 @@ mod tests {
     }
 
     #[test]
-    fn load_snapshot_rebuilds_missing_aux_indices() {
+    fn load_snapshot_restores_domains_and_lengths() {
         let mut index = InMemoryIndex::default();
         index.add_doc(INDEX, DOC_CN, "你好世界", true);
 
-        let mut snapshot = index
+        let snapshot = index
             .get_snapshot_data(INDEX)
             .expect("snapshot should exist");
-        if let Some(full) = snapshot.domains.get_mut(&TermDomain::PinyinFull) {
-            full.term_dict.clear();
-            full.ngram_index.clear();
-        }
-        if let Some(initials) = snapshot.domains.get_mut(&TermDomain::PinyinInitials) {
-            initials.term_dict.clear();
-            initials.ngram_index.clear();
-        }
+        let expected_total_len = snapshot.total_len;
+        let expected_domain_len = snapshot.domain_total_len.get(TermDomain::Original);
 
         let mut restored = InMemoryIndex::default();
         restored.load_snapshot(INDEX, snapshot);
@@ -650,23 +644,29 @@ mod tests {
         let hits = restored.search_hits(INDEX, "nihap");
         assert!(
             hits.iter().any(|hit| hit.doc_id == DOC_CN),
-            "expected rebuilt pinyin aux indices to allow fuzzy hits"
+            "expected restored index to serve pinyin fuzzy hits"
         );
+        let restored_domains = restored
+            .domains
+            .get(INDEX)
+            .expect("restored domains should exist");
+        let restored_full = restored_domains
+            .get(&TermDomain::PinyinFull)
+            .expect("restored snapshot should include pinyin full domain");
         assert!(
-            restored
-                .domains
-                .get(INDEX)
-                .and_then(|domains| domains.get(&TermDomain::PinyinFull))
-                .is_some_and(|d| !d.term_dict.is_empty()),
-            "expected pinyin full dictionary to be rebuilt from doc data"
+            !restored_full.term_dict.is_empty(),
+            "expected restored pinyin full dictionary to be populated"
         );
-        assert!(
+        assert_eq!(
+            restored.total_lens.get(INDEX).copied(),
+            Some(expected_total_len)
+        );
+        assert_eq!(
             restored
-                .domains
+                .domain_total_lens
                 .get(INDEX)
-                .and_then(|domains| domains.get(&TermDomain::PinyinInitials))
-                .is_some_and(|d| !d.term_dict.is_empty()),
-            "expected pinyin initials dictionary to be rebuilt from doc data"
+                .map(|d| d.get(TermDomain::Original)),
+            Some(expected_domain_len)
         );
     }
 
@@ -699,57 +699,6 @@ mod tests {
             hits.iter().any(|h| h.doc_id == "doc-short-cjk"),
             "expected 2-gram fuzzy recall for short CJK tokens, got {:?}",
             hits
-        );
-    }
-
-    #[test]
-    fn snapshot_v2_rebuilds_derived_spans() {
-        let mut term_pos: HashMap<String, Vec<(u32, u32)>> = HashMap::new();
-        term_pos.insert("你好".to_string(), vec![(0, 6)]);
-        term_pos.insert("nihao".to_string(), vec![(0, 6)]);
-
-        let mut term_freqs: HashMap<String, TermFrequency> = HashMap::new();
-        let mut freq_original = TermFrequency::default();
-        freq_original.increment(TermDomain::Original);
-        term_freqs.insert("你好".to_string(), freq_original);
-        let mut freq_pinyin = TermFrequency::default();
-        freq_pinyin.increment(TermDomain::PinyinFull);
-        term_freqs.insert("nihao".to_string(), freq_pinyin);
-
-        let mut docs = HashMap::new();
-        docs.insert(
-            DOC_CN.to_string(),
-            DocData {
-                content: "你好".to_string(),
-                doc_len: 2,
-                term_pos,
-                term_freqs,
-                domain_doc_len: DomainLengths::default(),
-                derived_terms: HashMap::new(),
-            },
-        );
-
-        let snapshot = SnapshotData {
-            version: 2,
-            docs,
-            domains: HashMap::new(),
-        };
-
-        let mut index = InMemoryIndex::default();
-        index.load_snapshot(INDEX, snapshot);
-
-        let hits = index.search_hits(INDEX, "nihao");
-        assert!(
-            hits.iter().any(|h| h.doc_id == DOC_CN),
-            "expected legacy snapshot to rebuild pinyin hits, got {:?}",
-            hits
-        );
-
-        let matches = index.get_matches(INDEX, DOC_CN, "nihao");
-        assert!(
-            matches.iter().any(|(s, e)| (*s, *e) == (0, 2)),
-            "expected derived spans converted to utf16, got {:?}",
-            matches
         );
     }
 
