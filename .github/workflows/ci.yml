@@ -1,0 +1,84 @@
+name: CI
+
+on:
+    push:
+        branches: [master]
+    pull_request:
+        branches: [master]
+
+permissions:
+    contents: read
+    issues: write
+    pull-requests: write
+
+jobs:
+    test-and-bench:
+        runs-on: ubuntu-latest
+        env:
+            CARGO_TERM_COLOR: always
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+
+            - name: Install Rust
+              uses: dtolnay/rust-toolchain@stable
+
+            - name: Cache cargo build
+              uses: Swatinem/rust-cache@v2
+
+            - name: Install cargo-nextest
+              uses: taiki-e/install-action@v2
+              with:
+                  tool: nextest
+
+            - name: Run tests
+              run: cargo nextest run --locked
+
+            - name: Run benchmarks
+              run: cargo bench --bench indexer --locked -- --output-format bencher | tee bench_output.txt
+
+            - name: Publish benchmark comment
+              if: github.event_name == 'pull_request'
+              uses: actions/github-script@v7
+              with:
+                  script: |
+                      const fs = require('fs');
+                      const marker = '<!-- benchmark-memory-indexer -->';
+                      let benchText = '';
+
+                      try {
+                        benchText = fs.readFileSync('bench_output.txt', 'utf8').trim();
+                      } catch (error) {
+                        benchText = 'Benchmark output missing or failed to generate.';
+                      }
+
+                      const body = `${marker}\n## Benchmark results\n\`\`\`\n${benchText}\n\`\`\`\n`;
+
+                      const { owner, repo } = context.repo;
+                      const issue_number = context.issue.number;
+                      const { data: comments } = await github.rest.issues.listComments({
+                        owner,
+                        repo,
+                        issue_number,
+                        per_page: 100,
+                      });
+
+                      const existing = comments.find(
+                        (comment) => comment.body && comment.body.includes(marker)
+                      );
+
+                      if (existing) {
+                        await github.rest.issues.updateComment({
+                          owner,
+                          repo,
+                          comment_id: existing.id,
+                          body,
+                        });
+                      } else {
+                        await github.rest.issues.createComment({
+                          owner,
+                          repo,
+                          issue_number,
+                          body,
+                        });
+                      }

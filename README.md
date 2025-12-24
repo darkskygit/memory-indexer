@@ -3,19 +3,29 @@
 In-memory multilingual full-text indexer with pinyin-first search, prefix and fuzzy recall—built for chat memory, note-taking, or local knowledge bases.
 
 ## Highlights
-- Out of box CJK support
-  [x] chinese and pinyin fuzzy search
-  [x] japanese/korean n-grams with custom dictionaries
-  [x] mixed-script text supported
-- Ranking and routing
-  [x] BM25 with minimum-should-match
-  [x] ASCII queries auto-route exact → pinyin → fuzzy
-  [x] non-ASCII uses 2/3-gram + Levenshtein fuzzy
-- Highlight-friendly offsets: UTF-8/UTF-16 positions supported
-- Index snapshots: compressed binary format for persistence and fast loading
-- Pluggable dictionaries: inject or train Japanese/Hangul dictionaries for better tokenization
+
+- [x] Out-of-the-box CJK support
+
+    - [x] chinese and pinyin fuzzy search
+
+    - [x] japanese/korean n-grams with custom dictionaries
+
+    - [x] mixed-script text supported
+
+- [x] Ranking and routing
+
+    - [x] BM25 with minimum-should-match
+
+    - [x] ASCII queries auto-route exact → pinyin → fuzzy
+
+    - [x] non-ASCII uses 2/3-gram + Levenshtein fuzzy
+
+- [x] Highlight-friendly offsets: UTF-8/UTF-16 positions supported
+- [x] Index snapshots: compressed binary format for persistence and fast loading
+- [x] Pluggable dictionaries: inject or train Japanese/Hangul dictionaries for better tokenization
 
 ## Quick start
+
 ```rust
 use memory_indexer::{InMemoryIndex, SearchMode};
 
@@ -39,6 +49,10 @@ let snapshot = index.get_snapshot_data("kb").unwrap();
 ```
 
 ## Development
-- Tests: `cargo test`
-- Benchmarks (Criterion v3): `cargo bench` (index build, pinyin/fuzzy paths, snapshot serialization)
-- License: AGPL-3.0-or-later
+
+-   Tests: `cargo test`
+-   Benchmarks: `cargo bench`
+
+## License
+
+> AGPL-3.0-or-later
