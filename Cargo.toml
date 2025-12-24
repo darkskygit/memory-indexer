@@ -1,0 +1,30 @@
+[package]
+name = "memory-indexer"
+version = "0.1.0"
+edition = "2024"
+authors = ["DarkSky <darksky2048@gmail.com>"]
+license = "AGPL-3.0-or-later"
+include = ["src/**/*", "benches/**/*", "README.md"]
+homepage = "https://github.com/darkskygit/memory-indexer"
+repository = "https://github.com/darkskygit/memory-indexer"
+keywords = ["search", "index", "in-memory", "full-text", "fuzzy"]
+description = "An in-memory full-text fuzzy search indexer."
+readme = "README.md"
+
+[dependencies]
+jieba-rs = "0.8"
+once_cell = "1"
+pinyin = { version = "0.10", features = ["heteronym"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+strsim = "0.11"
+unicode-normalization = "0.1"
+unicode-script = "0.5"
+
+[dev-dependencies]
+criterion2 = "3"
+tempfile = "3"
+
+[[bench]]
+name = "indexer"
+harness = false
