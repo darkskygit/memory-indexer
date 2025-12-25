@@ -173,6 +173,12 @@ pub struct InMemoryIndex {
     pub dictionary: Option<DictionaryConfig>,
 }
 
+impl InMemoryIndex {
+    pub fn snapshot_version() -> u32 {
+        SNAPSHOT_VERSION
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Segment<'a> {
     pub script: SegmentScript,

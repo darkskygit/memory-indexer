@@ -838,4 +838,39 @@ mod tests {
             fallback_hits
         );
     }
+
+    #[test]
+    fn id_like_tokens_skip_aux_but_still_match_exact() {
+        let mut index = InMemoryIndex::default();
+        let doc_id = "doc-id";
+        let id_like = "IKPeA9Zu9eo_pXlKWVFcf";
+
+        index.add_doc(INDEX, doc_id, id_like, true);
+
+        let hits = index.search_with_mode_hits(INDEX, id_like, SearchMode::Exact);
+        assert!(
+            hits.iter().any(|h| h.doc_id == doc_id),
+            "expected exact search to hit id-like token, got {:?}",
+            hits
+        );
+
+        let token = id_like.to_lowercase();
+        if let Some(term_dict) = domain_term_dict(&index, TermDomain::Original) {
+            assert!(
+                !term_dict.contains(&token),
+                "id-like tokens should skip fuzzy aux dictionary, got {:?}",
+                term_dict
+            );
+        }
+        if let Some(ngram_index) = domain_ngram_index(&index, TermDomain::Original) {
+            let contains = ngram_index
+                .values()
+                .any(|terms| terms.iter().any(|t| t == &token));
+            assert!(
+                !contains,
+                "id-like tokens should skip ngram aux indexing, got {:?}",
+                ngram_index
+            );
+        }
+    }
 }

@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use super::tokenizer::is_ascii_id_like;
+
 use strsim::normalized_levenshtein;
 
 #[derive(Debug, Clone, Copy)]
@@ -129,5 +131,5 @@ fn fuzzy_threshold(term_len: usize, base: f64) -> f64 {
 }
 
 pub fn should_index_in_original_aux(term: &str) -> bool {
-    term.chars().any(|c| c.is_alphanumeric())
+    term.chars().any(|c| c.is_alphanumeric()) && !is_ascii_id_like(term)
 }
