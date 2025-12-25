@@ -199,6 +199,44 @@ impl InMemoryIndex {
         (dirty_data, deleted)
     }
 
+    /// Returns true if the index has new changes awaiting persistence.
+    /// Pass `Some(name)` to check a specific index or `None` to check all.
+    pub fn has_unpersisted_changes(&self, index_name: Option<&str>) -> bool {
+        match index_name {
+            Some(name) => {
+                self.dirty.get(name).map_or(false, |s| !s.is_empty())
+                    || self.deleted.get(name).map_or(false, |s| !s.is_empty())
+            }
+            None => {
+                self.dirty.values().any(|s| !s.is_empty())
+                    || self.deleted.values().any(|s| !s.is_empty())
+            }
+        }
+    }
+
+    /// Persist the given index only if there are pending changes.
+    ///
+    /// Returns `Ok(true)` if persistence was attempted (and succeeded), `Ok(false)` if skipped.
+    /// The index is marked clean only after the provided callback returns `Ok`.
+    pub fn persist_if_dirty<E>(
+        &mut self,
+        index_name: &str,
+        mut persist: impl FnMut(SnapshotData) -> Result<(), E>,
+    ) -> Result<bool, E> {
+        if !self.has_unpersisted_changes(Some(index_name)) {
+            return Ok(false);
+        }
+
+        let Some(snapshot) = self.get_snapshot_data(index_name) else {
+            return Ok(false);
+        };
+
+        persist(snapshot)?;
+        self.dirty.remove(index_name);
+        self.deleted.remove(index_name);
+        Ok(true)
+    }
+
     /// Get byte/UTF-16 spans for a query's terms within a document by re-tokenizing the query.
     pub fn get_matches(&self, index_name: &str, doc_id: &str, query: &str) -> Vec<(u32, u32)> {
         let query_terms: Vec<String> = self
@@ -262,6 +300,8 @@ impl InMemoryIndex {
             maps.version
         };
         self.versions.insert(index_name.to_string(), version);
+        self.dirty.remove(index_name);
+        self.deleted.remove(index_name);
     }
 
     /// Get a serializable snapshot of the given index, including aux dictionaries/ngrams.

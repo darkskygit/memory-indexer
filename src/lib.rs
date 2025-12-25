@@ -671,6 +671,96 @@ mod tests {
     }
 
     #[test]
+    fn has_unpersisted_changes_tracks_dirty_and_deleted() {
+        let mut index = InMemoryIndex::default();
+        assert!(!index.has_unpersisted_changes(None));
+
+        index.add_doc(INDEX, DOC_EN, "pending doc", true);
+        assert!(index.has_unpersisted_changes(Some(INDEX)));
+        assert!(index.has_unpersisted_changes(None));
+
+        index.take_dirty_and_deleted();
+        assert!(!index.has_unpersisted_changes(Some(INDEX)));
+        assert!(!index.has_unpersisted_changes(None));
+
+        index.remove_doc(INDEX, DOC_EN);
+        assert!(index.has_unpersisted_changes(Some(INDEX)));
+        assert!(index.has_unpersisted_changes(None));
+    }
+
+    #[test]
+    fn load_snapshot_clears_pending_flags() {
+        let mut index = InMemoryIndex::default();
+        index.add_doc(INDEX, DOC_EN, "snapshot doc", true);
+
+        let snapshot = index
+            .get_snapshot_data(INDEX)
+            .expect("snapshot should exist");
+        assert!(index.has_unpersisted_changes(Some(INDEX)));
+
+        index.load_snapshot(INDEX, snapshot);
+        assert!(
+            !index.has_unpersisted_changes(Some(INDEX)),
+            "loading a snapshot should reset pending persistence markers"
+        );
+    }
+
+    #[test]
+    fn persist_if_dirty_skips_when_clean() {
+        let mut index = InMemoryIndex::default();
+        let mut called = false;
+
+        let persisted = index
+            .persist_if_dirty(INDEX, |_snapshot| -> Result<(), ()> {
+                called = true;
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(!persisted, "clean index should skip persistence");
+        assert!(!called, "callback should not run when skipped");
+    }
+
+    #[test]
+    fn persist_if_dirty_persists_and_marks_clean_on_success() {
+        let mut index = InMemoryIndex::default();
+        index.add_doc(INDEX, DOC_EN, "persist me", true);
+
+        let mut called = false;
+        let persisted = index
+            .persist_if_dirty(INDEX, |snapshot| -> Result<(), ()> {
+                called = true;
+                assert_eq!(snapshot.docs.len(), 1, "snapshot should include doc");
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(persisted, "dirty index should persist");
+        assert!(called, "callback should run on persistence");
+        assert!(
+            !index.has_unpersisted_changes(Some(INDEX)),
+            "successful persist should mark index clean"
+        );
+    }
+
+    #[test]
+    fn persist_if_dirty_keeps_pending_on_error() {
+        let mut index = InMemoryIndex::default();
+        index.add_doc(INDEX, DOC_EN, "persist error", true);
+
+        let err = index
+            .persist_if_dirty(INDEX, |_snapshot| -> Result<(), &'static str> {
+                Err("boom")
+            })
+            .unwrap_err();
+        assert_eq!(err, "boom");
+        assert!(
+            index.has_unpersisted_changes(Some(INDEX)),
+            "failed persist should leave index dirty"
+        );
+    }
+
+    #[test]
     fn fuzzy_msm_filters_insufficient_matches() {
         let mut index = InMemoryIndex::default();
         index.add_doc(INDEX, "doc-long", "apple banana", true);
