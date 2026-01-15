@@ -9,8 +9,8 @@ mod pinyin;
 mod script;
 
 pub use dictionary::{DictionaryConfig, DictionarySegmenter};
-pub use normalize::{TextNormalizer, TextNormalizerRef, normalize_query, normalize_term};
 pub use normalize::is_ascii_id_like;
+pub use normalize::{TextNormalizer, TextNormalizerRef, normalize_query, normalize_term};
 pub use pinyin::{
     build_pinyin_variants, cjk_spans, contains_chinese_chars, should_derive_pinyin_for_span,
 };
@@ -94,10 +94,10 @@ pub(crate) fn tokenize_japanese(
     out: &mut Vec<TokenWithScript>,
     seen: &mut HashSet<(String, usize, usize)>,
 ) {
-    if let Some(dict) = dictionary {
-        if dict.segment(segment, base_start, script, normalizer, out, seen) {
-            return;
-        }
+    if let Some(dict) = dictionary
+        && dict.segment(segment, base_start, script, normalizer, out, seen)
+    {
+        return;
     }
 
     tokenize_char_ngrams(segment, base_start, script, normalizer, out, seen);
@@ -112,10 +112,10 @@ pub(crate) fn tokenize_hangul(
     out: &mut Vec<TokenWithScript>,
     seen: &mut HashSet<(String, usize, usize)>,
 ) {
-    if let Some(dict) = dictionary {
-        if dict.segment(segment, base_start, script, normalizer, out, seen) {
-            return;
-        }
+    if let Some(dict) = dictionary
+        && dict.segment(segment, base_start, script, normalizer, out, seen)
+    {
+        return;
     }
 
     tokenize_char_ngrams(segment, base_start, script, normalizer, out, seen);

@@ -42,15 +42,15 @@ impl DictionarySegmenter {
 
     pub fn export(&self) -> Vec<DictionaryExport> {
         let mut exports = Vec::new();
-        if let Some(dict) = &self.config.japanese {
-            if let Some(export) = export_dictionary(DictionaryLanguage::Japanese, dict) {
-                exports.push(export);
-            }
+        if let Some(dict) = &self.config.japanese
+            && let Some(export) = export_dictionary(DictionaryLanguage::Japanese, dict)
+        {
+            exports.push(export);
         }
-        if let Some(dict) = &self.config.hangul {
-            if let Some(export) = export_dictionary(DictionaryLanguage::Hangul, dict) {
-                exports.push(export);
-            }
+        if let Some(dict) = &self.config.hangul
+            && let Some(export) = export_dictionary(DictionaryLanguage::Hangul, dict)
+        {
+            exports.push(export);
         }
         exports
     }
@@ -105,8 +105,8 @@ impl DictionarySegmenter {
                     out,
                     seen,
                 );
-                for i in start_idx..end_idx {
-                    covered[i] = true;
+                for item in covered.iter_mut().take(end_idx).skip(start_idx) {
+                    *item = true;
                 }
                 idx = end_idx;
             } else {
@@ -300,12 +300,12 @@ fn language_prefix(language: DictionaryLanguage) -> &'static str {
 }
 
 fn matches_language(script: SegmentScript, language: DictionaryLanguage) -> bool {
-    match (language, script) {
+    matches!(
+        (language, script),
         (DictionaryLanguage::Japanese, SegmentScript::Hiragana)
-        | (DictionaryLanguage::Japanese, SegmentScript::Katakana) => true,
-        (DictionaryLanguage::Hangul, SegmentScript::Hangul) => true,
-        _ => false,
-    }
+            | (DictionaryLanguage::Japanese, SegmentScript::Katakana)
+            | (DictionaryLanguage::Hangul, SegmentScript::Hangul)
+    )
 }
 
 #[cfg(test)]

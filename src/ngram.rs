@@ -1,7 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use super::tokenizer::is_ascii_id_like;
+use super::types::TermId;
 
+use smol_str::SmolStr;
 use strsim::normalized_levenshtein;
 
 #[derive(Debug, Clone, Copy)]
@@ -18,42 +20,64 @@ pub const DEFAULT_FUZZY_PARAMS: FuzzyParams = FuzzyParams {
     max_len_diff: 2,
 };
 
+pub fn build_ngram_index(term_ids: &[TermId], terms: &[SmolStr]) -> HashMap<SmolStr, Vec<TermId>> {
+    let mut index: HashMap<SmolStr, Vec<TermId>> = HashMap::new();
+    for &term_id in term_ids {
+        let Some(term) = terms.get(term_id as usize) else {
+            continue;
+        };
+        for gram in generate_ngrams(term.as_str()) {
+            if let Some(entries) = index.get_mut(gram.as_str()) {
+                entries.push(term_id);
+            } else {
+                index.insert(SmolStr::new(gram), vec![term_id]);
+            }
+        }
+    }
+    index
+}
+
 pub fn collect_fuzzy_candidates(
-    ngram_index: &HashMap<String, Vec<String>>,
-    term_dict: &HashSet<String>,
+    ngram_index: &HashMap<SmolStr, Vec<TermId>>,
+    term_ids: &[TermId],
+    terms: &[SmolStr],
     term: &str,
     params: FuzzyParams,
-) -> Vec<(String, f64)> {
+    exact_term: Option<TermId>,
+) -> Vec<(TermId, f64)> {
     let ngrams = generate_ngrams(term);
     if ngrams.is_empty() {
-        if term_dict.contains(term) {
-            return vec![(term.to_string(), 1.0)];
+        if let Some(term_id) = exact_term {
+            return vec![(term_id, 1.0)];
         }
-        return collect_from_term_dict(term_dict, term, params);
+        return collect_from_term_list(term_ids, terms, term, params);
     }
 
     let term_len = term.chars().count();
     let sim_threshold = fuzzy_threshold(term_len, params.sim_threshold);
-    let mut counts: HashMap<String, usize> = HashMap::new();
+    let mut counts: HashMap<TermId, usize> = HashMap::new();
     for gram in ngrams {
-        if let Some(terms) = ngram_index.get(&gram) {
-            for candidate in terms {
-                *counts.entry(candidate.clone()).or_insert(0) += 1;
+        if let Some(candidates) = ngram_index.get(gram.as_str()) {
+            for &candidate in candidates {
+                *counts.entry(candidate).or_insert(0) += 1;
             }
         }
     }
 
-    let mut ranked: Vec<(String, usize)> = counts.into_iter().collect();
+    let mut ranked: Vec<(TermId, usize)> = counts.into_iter().collect();
     ranked.sort_by(|a, b| b.1.cmp(&a.1));
     ranked.truncate(params.max_candidates.saturating_mul(2));
 
     let mut filtered = Vec::new();
     for (candidate, _) in ranked {
-        let candidate_len = candidate.chars().count();
+        let Some(candidate_term) = terms.get(candidate as usize) else {
+            continue;
+        };
+        let candidate_len = candidate_term.chars().count();
         if length_gap_exceeds(term_len, candidate_len, params.max_len_diff) {
             continue;
         }
-        let similarity = normalized_levenshtein(&candidate, term);
+        let similarity = normalized_levenshtein(candidate_term.as_str(), term);
         if similarity >= sim_threshold {
             filtered.push((candidate, similarity));
         }
@@ -64,47 +88,29 @@ pub fn collect_fuzzy_candidates(
     filtered
 }
 
-fn collect_from_term_dict(
-    term_dict: &HashSet<String>,
+fn collect_from_term_list(
+    term_ids: &[TermId],
+    terms: &[SmolStr],
     term: &str,
     params: FuzzyParams,
-) -> Vec<(String, f64)> {
+) -> Vec<(TermId, f64)> {
     let term_len = term.chars().count();
     let sim_threshold = fuzzy_threshold(term_len, params.sim_threshold);
-    let mut candidates: Vec<(String, f64)> = term_dict
+    let mut candidates: Vec<(TermId, f64)> = term_ids
         .iter()
-        .filter(|candidate| {
-            let candidate_len = candidate.chars().count();
-            !length_gap_exceeds(term_len, candidate_len, params.max_len_diff)
-        })
-        .filter_map(|candidate| {
-            let similarity = normalized_levenshtein(candidate, term);
-            (similarity >= sim_threshold).then_some((candidate.clone(), similarity))
+        .filter_map(|&candidate| {
+            let candidate_term = terms.get(candidate as usize)?;
+            let candidate_len = candidate_term.chars().count();
+            if length_gap_exceeds(term_len, candidate_len, params.max_len_diff) {
+                return None;
+            }
+            let similarity = normalized_levenshtein(candidate_term.as_str(), term);
+            (similarity >= sim_threshold).then_some((candidate, similarity))
         })
         .collect();
     candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     candidates.truncate(params.max_candidates);
     candidates
-}
-
-pub fn add_term_to_ngrams(index: &mut HashMap<String, Vec<String>>, term: &str) {
-    for gram in generate_ngrams(term) {
-        let terms = index.entry(gram).or_default();
-        if !terms.contains(&term.to_string()) {
-            terms.push(term.to_string());
-        }
-    }
-}
-
-pub fn remove_term_from_ngrams(index: &mut HashMap<String, Vec<String>>, term: &str) {
-    for gram in generate_ngrams(term) {
-        if let Some(terms) = index.get_mut(&gram) {
-            terms.retain(|t| t != term);
-            if terms.is_empty() {
-                index.remove(&gram);
-            }
-        }
-    }
 }
 
 pub fn generate_ngrams(term: &str) -> Vec<String> {
@@ -122,7 +128,7 @@ pub fn generate_ngrams(term: &str) -> Vec<String> {
 }
 
 fn length_gap_exceeds(a: usize, b: usize, max_gap: usize) -> bool {
-    let diff = if a >= b { a - b } else { b - a };
+    let diff = a.abs_diff(b);
     diff > max_gap
 }
 

@@ -5,14 +5,8 @@ use std::{
 
 use crate::{
     tokenizer::build_pinyin_variants,
-    types::{NormalizedTerm, PipelineToken, TermDomain, TermFrequency, TokenDraft},
+    types::{NormalizedTerm, PipelineToken, TermDomain, TokenDraft},
 };
-
-// Prefix bounds to avoid exploding prefix variants: skip 1-char full prefixes and cap both forms.
-const PINYIN_FULL_PREFIX_MIN: usize = 2;
-const PINYIN_FULL_PREFIX_MAX: usize = 16;
-const PINYIN_INITIALS_PREFIX_MIN: usize = 1;
-const PINYIN_INITIALS_PREFIX_MAX: usize = 16;
 
 pub struct PassthroughNormalizer;
 
@@ -83,101 +77,6 @@ impl PinyinVariantDeriver {
     }
 }
 
-pub struct PrefixDerivers {
-    full: AsciiPrefixDeriver,
-    initials: AsciiPrefixDeriver,
-}
-
-impl PrefixDerivers {
-    pub fn pinyin_defaults() -> Self {
-        Self {
-            full: AsciiPrefixDeriver::new(
-                TermDomain::PinyinFullPrefix,
-                PINYIN_FULL_PREFIX_MIN,
-                PINYIN_FULL_PREFIX_MAX,
-                |freqs| freqs.get(TermDomain::PinyinFull) > 0,
-            ),
-            initials: AsciiPrefixDeriver::new(
-                TermDomain::PinyinInitialsPrefix,
-                PINYIN_INITIALS_PREFIX_MIN,
-                PINYIN_INITIALS_PREFIX_MAX,
-                |freqs| freqs.get(TermDomain::PinyinInitials) > 0,
-            ),
-        }
-    }
-}
-
-impl PrefixDerivers {
-    pub fn derive_prefixes(
-        &self,
-        token: &PipelineToken,
-        term_freqs: &HashMap<String, TermFrequency>,
-    ) -> Vec<PipelineToken> {
-        match token.domain {
-            TermDomain::PinyinFull => self.full.derive_prefixes(token, term_freqs),
-            TermDomain::PinyinInitials => self.initials.derive_prefixes(token, term_freqs),
-            _ => Vec::new(),
-        }
-    }
-}
-
-pub struct AsciiPrefixDeriver {
-    domain: TermDomain,
-    min_len: usize,
-    max_len: usize,
-    should_skip: fn(&TermFrequency) -> bool,
-}
-
-impl AsciiPrefixDeriver {
-    pub fn new(
-        domain: TermDomain,
-        min_len: usize,
-        max_len: usize,
-        should_skip: fn(&TermFrequency) -> bool,
-    ) -> Self {
-        Self {
-            domain,
-            min_len,
-            max_len,
-            should_skip,
-        }
-    }
-}
-
-impl AsciiPrefixDeriver {
-    pub fn derive_prefixes(
-        &self,
-        token: &PipelineToken,
-        term_freqs: &HashMap<String, TermFrequency>,
-    ) -> Vec<PipelineToken> {
-        if !token.term.is_ascii() {
-            return Vec::new();
-        }
-        let mut prefixes = Vec::new();
-        let max_len = self.max_len.min(token.term.len().saturating_sub(1));
-        if max_len < self.min_len {
-            return prefixes;
-        }
-
-        for len in self.min_len..=max_len {
-            let prefix = token.term[..len].to_string();
-            if term_freqs
-                .get(&prefix)
-                .is_some_and(|freqs| (self.should_skip)(freqs))
-            {
-                continue;
-            }
-            prefixes.push(PipelineToken {
-                term: prefix,
-                span: token.span,
-                domain: self.domain,
-                base_term: token.base_term.clone(),
-            });
-        }
-        prefixes
-    }
-}
-
 pub struct NoopNgramDeriver;
 
 impl NoopNgramDeriver {
@@ -221,10 +120,10 @@ where
             self.map.insert(key, value);
             return;
         }
-        if self.map.len() >= self.capacity {
-            if let Some(oldest) = self.order.pop_front() {
-                self.map.remove(&oldest);
-            }
+        if self.map.len() >= self.capacity
+            && let Some(oldest) = self.order.pop_front()
+        {
+            self.map.remove(&oldest);
         }
         self.order.push_back(key.clone());
         self.map.insert(key, value);

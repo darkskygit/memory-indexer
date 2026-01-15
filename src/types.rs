@@ -1,10 +1,15 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
+use smol_str::SmolStr;
 
 use super::tokenizer::{DictionaryConfig, OffsetMap, SegmentScript, TokenWithScript};
 
-pub const SNAPSHOT_VERSION: u32 = 4;
+pub const SNAPSHOT_VERSION: u32 = 5;
+
+pub type TermId = u32;
+pub type DocId = u32;
 
 /// Search execution strategy for a query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,47 +30,28 @@ pub enum TermDomain {
     Original,
     PinyinFull,
     PinyinInitials,
-    PinyinFullPrefix,
-    PinyinInitialsPrefix,
 }
 
-const TERM_DOMAIN_COUNT: usize = 5;
+pub(crate) const TERM_DOMAIN_COUNT: usize = 3;
 
-const fn domain_index(domain: TermDomain) -> usize {
+pub(crate) const fn domain_index(domain: TermDomain) -> usize {
     match domain {
         TermDomain::Original => 0,
         TermDomain::PinyinFull => 1,
         TermDomain::PinyinInitials => 2,
-        TermDomain::PinyinFullPrefix => 3,
-        TermDomain::PinyinInitialsPrefix => 4,
     }
 }
 
 impl TermDomain {
     /// Returns true if the domain represents a pinyin-derived token.
     pub fn is_pinyin(&self) -> bool {
-        matches!(
-            self,
-            TermDomain::PinyinFull
-                | TermDomain::PinyinInitials
-                | TermDomain::PinyinFullPrefix
-                | TermDomain::PinyinInitialsPrefix
-        )
-    }
-
-    /// Returns true if the domain stores prefix tokens rather than full terms.
-    pub fn is_prefix(&self) -> bool {
-        matches!(
-            self,
-            TermDomain::PinyinFullPrefix | TermDomain::PinyinInitialsPrefix
-        )
+        matches!(self, TermDomain::PinyinFull | TermDomain::PinyinInitials)
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct DomainConfig {
     pub weight: f64,
-    pub enable_ngrams: bool,
     pub allow_fuzzy: bool,
 }
 
@@ -73,28 +59,15 @@ pub fn domain_config(domain: TermDomain) -> DomainConfig {
     match domain {
         TermDomain::Original => DomainConfig {
             weight: 1.0,
-            enable_ngrams: true,
             allow_fuzzy: true,
         },
         TermDomain::PinyinFull => DomainConfig {
             weight: 0.9,
-            enable_ngrams: true,
             allow_fuzzy: true,
         },
         TermDomain::PinyinInitials => DomainConfig {
             weight: 0.8,
-            enable_ngrams: true,
             allow_fuzzy: true,
-        },
-        TermDomain::PinyinFullPrefix => DomainConfig {
-            weight: 0.7,
-            enable_ngrams: false,
-            allow_fuzzy: false,
-        },
-        TermDomain::PinyinInitialsPrefix => DomainConfig {
-            weight: 0.75,
-            enable_ngrams: false,
-            allow_fuzzy: false,
         },
     }
 }
@@ -104,44 +77,92 @@ pub fn all_domains() -> &'static [TermDomain] {
         TermDomain::Original,
         TermDomain::PinyinFull,
         TermDomain::PinyinInitials,
-        TermDomain::PinyinFullPrefix,
-        TermDomain::PinyinInitialsPrefix,
     ]
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Posting {
+    pub doc: DocId,
+    pub freq: u32,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct DomainAux {
+    pub term_ids: Option<Vec<TermId>>,
+    pub ngram_index: Option<HashMap<SmolStr, Vec<TermId>>>,
+    pub prefix_index: Option<HashMap<SmolStr, Vec<TermId>>>,
+}
+
+impl DomainAux {
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    fn default_lock() -> RwLock<Self> {
+        RwLock::new(Self::default())
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct DomainIndex {
-    pub postings: HashMap<String, HashMap<String, i64>>,
-    pub term_dict: HashSet<String>,
-    pub ngram_index: HashMap<String, Vec<String>>,
+    pub postings: HashMap<TermId, Vec<Posting>>,
+    #[serde(skip, default = "DomainAux::default_lock")]
+    pub aux: RwLock<DomainAux>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct TermFrequency {
-    pub counts: HashMap<TermDomain, u32>,
+impl Clone for DomainIndex {
+    fn clone(&self) -> Self {
+        Self {
+            postings: self.postings.clone(),
+            aux: RwLock::new(DomainAux::default()),
+        }
+    }
 }
 
-impl TermFrequency {
-    pub fn increment(&mut self, domain: TermDomain) {
-        *self.counts.entry(domain).or_default() += 1;
+impl Default for DomainIndex {
+    fn default() -> Self {
+        Self {
+            postings: HashMap::new(),
+            aux: RwLock::new(DomainAux::default()),
+        }
     }
+}
 
-    pub fn get(&self, domain: TermDomain) -> u32 {
-        *self.counts.get(&domain).unwrap_or(&0)
-    }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TermPositions {
+    pub term: TermId,
+    pub positions: Vec<(u32, u32)>,
+}
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct TermFrequencyEntry {
+    pub term: TermId,
+    pub counts: [u32; TERM_DOMAIN_COUNT],
+}
+
+impl TermFrequencyEntry {
     pub fn positive_domains(&self) -> Vec<(TermDomain, u32)> {
         let mut domains = Vec::new();
         for domain in all_domains() {
-            if let Some(count) = self.counts.get(domain) {
-                if *count > 0 {
-                    domains.push((*domain, *count));
-                }
+            let count = self.counts[domain_index(*domain)];
+            if count > 0 {
+                domains.push((*domain, count));
             }
         }
         domains
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct DerivedTerm {
+    pub derived: TermId,
+    pub base: TermId,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct DerivedSpan {
+    pub derived: TermId,
+    pub span: (u32, u32),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,28 +170,42 @@ pub struct DocData {
     pub content: String,
     /// Document length in normalized tokens.
     pub doc_len: i64,
-    /// Term positions for original-domain tokens.
-    pub term_pos: HashMap<String, Vec<(u32, u32)>>,
-    #[serde(default)]
-    pub term_freqs: HashMap<String, TermFrequency>,
+    /// Term positions for original-domain tokens (by term id).
+    pub term_pos: Vec<TermPositions>,
+    /// Per-term frequencies for removal and length accounting.
+    pub term_freqs: Vec<TermFrequencyEntry>,
     #[serde(default)]
     pub domain_doc_len: DomainLengths,
+    /// Mapping from derived term id -> base term id for highlighting.
     #[serde(default)]
-    pub derived_terms: HashMap<String, Vec<(u32, u32)>>,
+    pub derived_terms: Vec<DerivedTerm>,
+    /// Fallback spans for derived terms that lack base term positions.
+    #[serde(default)]
+    pub derived_spans: Vec<DerivedSpan>,
 }
 
 /// In-memory inverted index supporting exact, pinyin, and fuzzy search over documents.
 #[derive(Debug)]
 pub struct InMemoryIndex {
-    pub versions: HashMap<String, u32>,
-    pub docs: HashMap<String, HashMap<String, DocData>>,
-    pub domains: HashMap<String, HashMap<TermDomain, DomainIndex>>,
-    pub total_lens: HashMap<String, i64>,
-    pub domain_total_lens: HashMap<String, DomainLengths>,
-    pub dirty: HashMap<String, HashSet<String>>,
-    pub deleted: HashMap<String, HashSet<String>>,
+    pub indexes: HashMap<String, IndexState>,
     pub position_encoding: PositionEncoding,
     pub dictionary: Option<DictionaryConfig>,
+}
+
+#[derive(Debug, Default)]
+pub struct IndexState {
+    pub version: u32,
+    pub terms: Vec<SmolStr>,
+    pub term_index: HashMap<SmolStr, TermId>,
+    pub docs: Vec<Option<DocData>>,
+    pub doc_ids: Vec<SmolStr>,
+    pub doc_index: HashMap<SmolStr, DocId>,
+    pub free_docs: Vec<DocId>,
+    pub domains: HashMap<TermDomain, DomainIndex>,
+    pub total_len: i64,
+    pub domain_total_len: DomainLengths,
+    pub dirty: HashSet<SmolStr>,
+    pub deleted: HashSet<SmolStr>,
 }
 
 impl InMemoryIndex {
@@ -223,17 +258,17 @@ pub struct PipelineToken {
 
 pub struct TokenStream {
     pub tokens: Vec<PipelineToken>,
-    pub term_freqs: HashMap<String, TermFrequency>,
     pub doc_len: i64,
 }
 
-/// Snapshot of per-domain auxiliary structures.
-/// Persisted index state including documents and aux domain data.
+/// Persisted index state including documents and per-domain postings.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SnapshotData {
     #[serde(default)]
     pub version: u32,
-    pub docs: HashMap<String, DocData>,
+    pub terms: Vec<SmolStr>,
+    pub docs: Vec<Option<DocData>>,
+    pub doc_ids: Vec<SmolStr>,
     pub domains: HashMap<TermDomain, DomainIndex>,
     pub total_len: i64,
     pub domain_total_len: DomainLengths,
@@ -264,13 +299,7 @@ pub enum PositionEncoding {
 impl Default for InMemoryIndex {
     fn default() -> Self {
         Self {
-            versions: HashMap::new(),
-            docs: HashMap::new(),
-            domains: HashMap::new(),
-            total_lens: HashMap::new(),
-            domain_total_lens: HashMap::new(),
-            dirty: HashMap::new(),
-            deleted: HashMap::new(),
+            indexes: HashMap::new(),
             position_encoding: PositionEncoding::Utf16,
             dictionary: None,
         }
@@ -325,10 +354,10 @@ impl DomainLengths {
         }
     }
 
-    pub fn from_term_freqs(freqs: &HashMap<String, TermFrequency>) -> Self {
+    pub fn from_term_freqs(freqs: &[TermFrequencyEntry]) -> Self {
         let mut lengths = Self::default();
-        for freqs in freqs.values() {
-            for (domain, count) in freqs.positive_domains() {
+        for entry in freqs {
+            for (domain, count) in entry.positive_domains() {
                 lengths.add(domain, count as i64);
             }
         }

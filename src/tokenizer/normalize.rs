@@ -67,7 +67,7 @@ impl IdLikeDetector {
     }
 
     fn is_id_like(&self) -> bool {
-        let class_count = self.class_mask.count_ones() as u32;
+        let class_count = self.class_mask.count_ones();
         // relaxed: vowels/alpha <= 0.30  <=> 10*vowels <= 3*alpha
         // strict : vowels/alpha <= 0.25  <=> 4*vowels <= alpha
         let low_vowel_relaxed = self.alpha == 0 || self.vowels * 10 <= self.alpha * 3;

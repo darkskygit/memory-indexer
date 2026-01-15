@@ -3,21 +3,32 @@ use std::{
     collections::{HashMap, HashSet},
 };
 
+use smol_str::SmolStr;
+
 use super::{
     super::{
+        ngram::{build_ngram_index, should_index_in_original_aux},
         tokenizer::Token,
-        types::{DocData, InMemoryIndex, SearchMode, domain_config},
+        types::{
+            DocData, DocId, InMemoryIndex, IndexState, Posting, SearchMode, TermDomain, TermId,
+            domain_config,
+        },
     },
-    MatchedTerm, SearchHit, TermDomain,
+    MatchedTerm, SearchHit,
     scoring::{
         MIN_SHOULD_MATCH_RATIO, bm25_component, compute_min_should_match, has_minimum_should_match,
         score_fuzzy_terms,
     },
 };
 
+const PINYIN_FULL_PREFIX_MIN: usize = 2;
+const PINYIN_INITIALS_PREFIX_MIN: usize = 1;
+const PINYIN_PREFIX_MAX: usize = 16;
+
 struct TermView<'a> {
-    term: String,
-    postings: &'a HashMap<String, i64>,
+    term_id: TermId,
+    term_text: String,
+    postings: &'a [Posting],
     weight: f64,
     domain: TermDomain,
 }
@@ -57,11 +68,12 @@ impl InMemoryIndex {
         mode: SearchMode,
     ) -> Vec<SearchHit> {
         if query == "*" || query.is_empty() {
-            if let Some(docs) = self.docs.get(index_name) {
-                return docs
+            if let Some(state) = self.indexes.get(index_name) {
+                return state
+                    .doc_index
                     .keys()
-                    .map(|k| SearchHit {
-                        doc_id: k.clone(),
+                    .map(|doc_id| SearchHit {
+                        doc_id: doc_id.to_string(),
                         score: 1.0,
                         matched_terms: Vec::new(),
                     })
@@ -128,36 +140,43 @@ impl InMemoryIndex {
             return vec![];
         }
 
-        let domains = match self.domains.get(index_name) {
-            Some(d) => d,
+        let state = match self.indexes.get(index_name) {
+            Some(state) => state,
             None => return vec![],
         };
 
-        let domain_index = match domains.get(&domain) {
+        let domain_index = match state.domains.get(&domain) {
             Some(idx) => idx,
             None => return vec![],
         };
 
-        let docs = match self.docs.get(index_name) {
-            Some(d) => d,
-            None => return vec![],
-        };
+        let doc_count = state.doc_index.len();
+        if doc_count == 0 {
+            return vec![];
+        }
 
         let mut term_views: Vec<TermView<'_>> = Vec::new();
         let weight = domain_config(domain).weight;
 
         for token in query_terms {
-            let Some(doc_map) = domain_index.postings.get(&token.term) else {
+            let Some(&term_id) = state.term_index.get(token.term.as_str()) else {
                 continue;
             };
-
-            if doc_map.is_empty() {
+            let Some(postings) = domain_index.postings.get(&term_id) else {
+                continue;
+            };
+            if postings.is_empty() {
                 continue;
             }
-
+            let term_text = state
+                .terms
+                .get(term_id as usize)
+                .map(|term| term.as_str().to_string())
+                .unwrap_or_else(|| token.term.clone());
             term_views.push(TermView {
-                term: token.term.clone(),
-                postings: doc_map,
+                term_id,
+                term_text,
+                postings,
                 weight,
                 domain,
             });
@@ -170,44 +189,45 @@ impl InMemoryIndex {
         let min_should_match =
             compute_min_should_match(query_terms.len(), term_views.len(), MIN_SHOULD_MATCH_RATIO);
 
-        let n = docs.len() as f64;
-        if n <= 0.0 {
-            return vec![];
-        }
-        let avgdl = average_doc_len(self, index_name, domain, docs.len());
+        let n = doc_count as f64;
+        let avgdl = average_doc_len(state, domain, doc_count);
 
         let mut idfs = HashMap::new();
         for view in &term_views {
             let n_q = view.postings.len() as f64;
             let idf = ((n - n_q + 0.5) / (n_q + 0.5) + 1.0).ln();
-            idfs.insert(view.term.clone(), idf);
+            idfs.insert(view.term_id, idf);
         }
 
-        let mut matches: HashMap<String, HashSet<MatchedTerm>> = HashMap::new();
-        let mut doc_scores: HashMap<String, f64> = HashMap::new();
+        let mut matches: HashMap<DocId, HashSet<MatchedTerm>> = HashMap::new();
+        let mut doc_scores: HashMap<DocId, f64> = HashMap::new();
         for view in &term_views {
-            for (doc_id, freq) in view.postings {
-                let Some(doc_data) = docs.get(doc_id) else {
+            let idf = *idfs.get(&view.term_id).unwrap_or(&0.0);
+            for posting in view.postings {
+                let Some(doc_data) = state
+                    .docs
+                    .get(posting.doc as usize)
+                    .and_then(|doc| doc.as_ref())
+                else {
                     continue;
                 };
-                let idf = *idfs.get(&view.term).unwrap_or(&0.0);
                 let component = bm25_component(
-                    *freq as f64,
+                    posting.freq as f64,
                     doc_len_for_domain(doc_data, view.domain),
                     avgdl,
                     idf,
                 ) * view.weight;
                 if component > 0.0 {
-                    *doc_scores.entry(doc_id.clone()).or_default() += component;
+                    *doc_scores.entry(posting.doc).or_default() += component;
                     matches
-                        .entry(doc_id.clone())
+                        .entry(posting.doc)
                         .or_default()
-                        .insert(MatchedTerm::new(view.term.clone(), view.domain));
+                        .insert(MatchedTerm::new(view.term_text.clone(), view.domain));
                 }
             }
         }
 
-        let mut scores: Vec<(String, f64)> = doc_scores
+        let mut scores: Vec<(DocId, f64)> = doc_scores
             .into_iter()
             .filter(|(doc_id, _)| {
                 matches
@@ -216,16 +236,19 @@ impl InMemoryIndex {
                     .unwrap_or(false)
             })
             .collect();
-        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
         scores
             .into_iter()
-            .map(|(doc_id, score)| SearchHit {
-                doc_id: doc_id.clone(),
-                score,
-                matched_terms: matches
-                    .remove(&doc_id)
-                    .map(|s| s.into_iter().collect())
-                    .unwrap_or_default(),
+            .filter_map(|(doc_id, score)| {
+                let doc_name = state.doc_ids.get(doc_id as usize)?.to_string();
+                Some(SearchHit {
+                    doc_id: doc_name,
+                    score,
+                    matched_terms: matches
+                        .remove(&doc_id)
+                        .map(|s| s.into_iter().collect())
+                        .unwrap_or_default(),
+                })
             })
             .collect()
     }
@@ -244,12 +267,22 @@ impl InMemoryIndex {
     }
 
     fn pinyin_prefix_search(&self, index_name: &str, query_terms: &[Token]) -> Vec<SearchHit> {
-        let full_prefix = self.bm25_search(index_name, query_terms, TermDomain::PinyinFullPrefix);
+        let full_prefix = self.prefix_search_in_domain(
+            index_name,
+            query_terms,
+            TermDomain::PinyinFull,
+            PINYIN_FULL_PREFIX_MIN,
+        );
         if !full_prefix.is_empty() {
             return full_prefix;
         }
 
-        self.bm25_search(index_name, query_terms, TermDomain::PinyinInitialsPrefix)
+        self.prefix_search_in_domain(
+            index_name,
+            query_terms,
+            TermDomain::PinyinInitials,
+            PINYIN_INITIALS_PREFIX_MIN,
+        )
     }
 
     fn pinyin_exact_search(&self, index_name: &str, query_terms: &[Token]) -> Vec<SearchHit> {
@@ -309,36 +342,69 @@ impl InMemoryIndex {
             return vec![];
         }
 
-        let docs = match self.docs.get(index_name) {
-            Some(d) => d,
+        let state = match self.indexes.get(index_name) {
+            Some(state) => state,
             None => return vec![],
         };
 
-        let domains = match self.domains.get(index_name) {
-            Some(d) => d,
-            None => return vec![],
-        };
-        let domain_index = match domains.get(&domain) {
+        let domain_index = match state.domains.get(&domain) {
             Some(idx) => idx,
             None => return vec![],
         };
 
-        let n = docs.len() as f64;
-        if n <= 0.0 {
+        let doc_count = state.doc_index.len();
+        if doc_count == 0 {
             return vec![];
         }
-        let avgdl = average_doc_len(self, index_name, domain, docs.len());
 
-        let mut doc_scores: HashMap<String, f64> = HashMap::new();
-        let mut matched_terms: HashMap<String, HashSet<MatchedTerm>> = HashMap::new();
+        {
+            let mut aux = domain_index.aux.write().unwrap();
+            if aux.term_ids.is_none() {
+                let mut ids: Vec<TermId> = domain_index
+                    .postings
+                    .keys()
+                    .copied()
+                    .filter(|term_id| {
+                        if domain == TermDomain::Original {
+                            state
+                                .terms
+                                .get(*term_id as usize)
+                                .map(|term| should_index_in_original_aux(term.as_str()))
+                                .unwrap_or(false)
+                        } else {
+                            true
+                        }
+                    })
+                    .collect();
+                ids.sort_unstable();
+                aux.term_ids = Some(ids);
+            }
+            if aux.ngram_index.is_none() {
+                let ids = aux.term_ids.as_ref().unwrap();
+                aux.ngram_index = Some(build_ngram_index(ids, &state.terms));
+            }
+        }
+        let aux = domain_index.aux.read().unwrap();
+        let term_ids = aux.term_ids.as_ref().unwrap();
+        let ngram_index = aux.ngram_index.as_ref().unwrap();
+
+        let n = doc_count as f64;
+        let avgdl = average_doc_len(state, domain, doc_count);
+
+        let mut doc_scores: HashMap<DocId, f64> = HashMap::new();
+        let mut matched_terms: HashMap<DocId, HashSet<MatchedTerm>> = HashMap::new();
         let weight = domain_config(domain).weight;
-        let mut matched_query_tokens: HashMap<String, HashSet<usize>> = HashMap::new();
+        let mut matched_query_tokens: HashMap<DocId, HashSet<usize>> = HashMap::new();
         let mut tokens_with_candidates: HashSet<usize> = HashSet::new();
 
         for (idx, token) in query_terms.iter().enumerate() {
+            let exact_term = state.term_index.get(token.term.as_str()).copied();
             score_fuzzy_terms(
-                docs,
+                &state.docs,
                 domain_index,
+                term_ids,
+                &state.terms,
+                ngram_index,
                 n,
                 avgdl,
                 &mut doc_scores,
@@ -348,8 +414,8 @@ impl InMemoryIndex {
                 domain,
                 weight,
                 &token.term,
-                &|doc_data| doc_len_for_domain(doc_data, domain),
                 idx,
+                exact_term,
             );
         }
 
@@ -359,7 +425,7 @@ impl InMemoryIndex {
             // would unfairly drop hits because of tokens with zero recall paths.
             compute_min_should_match(query_terms.len(), available_terms, MIN_SHOULD_MATCH_RATIO);
 
-        let mut scores: Vec<(String, f64)> = doc_scores
+        let mut scores: Vec<(DocId, f64)> = doc_scores
             .into_iter()
             .filter(|(doc_id, _)| {
                 matched_query_tokens
@@ -371,13 +437,173 @@ impl InMemoryIndex {
         scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
         scores
             .into_iter()
-            .map(|(doc_id, score)| SearchHit {
-                matched_terms: matched_terms
-                    .remove(&doc_id)
-                    .map(|s| s.into_iter().collect())
-                    .unwrap_or_default(),
-                doc_id,
-                score,
+            .filter_map(|(doc_id, score)| {
+                let doc_name = state.doc_ids.get(doc_id as usize)?.to_string();
+                Some(SearchHit {
+                    matched_terms: matched_terms
+                        .remove(&doc_id)
+                        .map(|s| s.into_iter().collect())
+                        .unwrap_or_default(),
+                    doc_id: doc_name,
+                    score,
+                })
+            })
+            .collect()
+    }
+
+    fn prefix_search_in_domain(
+        &self,
+        index_name: &str,
+        query_terms: &[Token],
+        domain: TermDomain,
+        min_prefix_len: usize,
+    ) -> Vec<SearchHit> {
+        if query_terms.is_empty() || !is_ascii_alphanumeric_query(query_terms) {
+            return vec![];
+        }
+
+        let state = match self.indexes.get(index_name) {
+            Some(state) => state,
+            None => return vec![],
+        };
+
+        let domain_index = match state.domains.get(&domain) {
+            Some(idx) => idx,
+            None => return vec![],
+        };
+
+        let doc_count = state.doc_index.len();
+        if doc_count == 0 {
+            return vec![];
+        }
+
+        {
+            let mut aux = domain_index.aux.write().unwrap();
+            if aux.term_ids.is_none() {
+                let mut ids: Vec<TermId> = domain_index.postings.keys().copied().collect();
+                ids.sort_unstable();
+                aux.term_ids = Some(ids);
+            }
+            if aux.prefix_index.is_none() {
+                let mut prefix_index: HashMap<SmolStr, Vec<TermId>> = HashMap::new();
+                let ids = aux.term_ids.as_ref().unwrap();
+                for &term_id in ids {
+                    let Some(term) = state.terms.get(term_id as usize) else {
+                        continue;
+                    };
+                    if !term.as_str().is_ascii() {
+                        continue;
+                    }
+                    let term_len = term.len();
+                    if term_len < min_prefix_len {
+                        continue;
+                    }
+                    let max = PINYIN_PREFIX_MAX.min(term_len);
+                    for len in min_prefix_len..=max {
+                        let prefix = SmolStr::new(&term.as_str()[..len]);
+                        prefix_index.entry(prefix).or_default().push(term_id);
+                    }
+                }
+                aux.prefix_index = Some(prefix_index);
+            }
+        }
+        let aux = domain_index.aux.read().unwrap();
+        let prefix_index = aux.prefix_index.as_ref().unwrap();
+
+        let n = doc_count as f64;
+        let avgdl = average_doc_len(state, domain, doc_count);
+
+        let mut doc_scores: HashMap<DocId, f64> = HashMap::new();
+        let mut matched_terms: HashMap<DocId, HashSet<MatchedTerm>> = HashMap::new();
+        let weight = domain_config(domain).weight;
+        let mut matched_query_tokens: HashMap<DocId, HashSet<usize>> = HashMap::new();
+        let mut tokens_with_candidates: HashSet<usize> = HashSet::new();
+
+        for (idx, token) in query_terms.iter().enumerate() {
+            if token.term.len() < min_prefix_len || token.term.len() > PINYIN_PREFIX_MAX {
+                continue;
+            }
+
+            let Some(candidates) = prefix_index.get(token.term.as_str()) else {
+                continue;
+            };
+            if candidates.is_empty() {
+                continue;
+            }
+
+            tokens_with_candidates.insert(idx);
+
+            for &candidate in candidates {
+                let Some(postings) = domain_index.postings.get(&candidate) else {
+                    continue;
+                };
+                if postings.is_empty() {
+                    continue;
+                }
+
+                let n_q = postings.len() as f64;
+                let idf = ((n - n_q + 0.5) / (n_q + 0.5) + 1.0).ln();
+                let candidate_text = state
+                    .terms
+                    .get(candidate as usize)
+                    .map(|term| term.as_str().to_string())
+                    .unwrap_or_else(|| token.term.clone());
+
+                for posting in postings {
+                    let Some(doc_data) = state
+                        .docs
+                        .get(posting.doc as usize)
+                        .and_then(|doc| doc.as_ref())
+                    else {
+                        continue;
+                    };
+                    let term_score = bm25_component(
+                        posting.freq as f64,
+                        doc_len_for_domain(doc_data, domain),
+                        avgdl,
+                        idf,
+                    ) * weight;
+                    if term_score > 0.0 {
+                        *doc_scores.entry(posting.doc).or_default() += term_score;
+                        matched_terms
+                            .entry(posting.doc)
+                            .or_default()
+                            .insert(MatchedTerm::new(candidate_text.clone(), domain));
+                        matched_query_tokens
+                            .entry(posting.doc)
+                            .or_default()
+                            .insert(idx);
+                    }
+                }
+            }
+        }
+
+        let available_terms = tokens_with_candidates.len();
+        let min_should_match =
+            compute_min_should_match(query_terms.len(), available_terms, MIN_SHOULD_MATCH_RATIO);
+
+        let mut scores: Vec<(DocId, f64)> = doc_scores
+            .into_iter()
+            .filter(|(doc_id, _)| {
+                matched_query_tokens
+                    .get(doc_id)
+                    .map(|set| set.len() >= min_should_match)
+                    .unwrap_or(false)
+            })
+            .collect();
+        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+        scores
+            .into_iter()
+            .filter_map(|(doc_id, score)| {
+                let doc_name = state.doc_ids.get(doc_id as usize)?.to_string();
+                Some(SearchHit {
+                    matched_terms: matched_terms
+                        .remove(&doc_id)
+                        .map(|s| s.into_iter().collect())
+                        .unwrap_or_default(),
+                    doc_id: doc_name,
+                    score,
+                })
             })
             .collect()
     }
@@ -390,12 +616,6 @@ pub(super) fn is_ascii_alphanumeric_query(tokens: &[Token]) -> bool {
 }
 
 fn doc_len_for_domain(doc_data: &DocData, domain: TermDomain) -> f64 {
-    if domain.is_prefix() {
-        // Prefix domains reuse positions but skip length normalization so short prefixes
-        // are not penalized compared to full tokens.
-        return 0.0;
-    }
-
     let len = doc_data.domain_doc_len.get(domain);
     if len > 0 {
         len as f64
@@ -404,21 +624,12 @@ fn doc_len_for_domain(doc_data: &DocData, domain: TermDomain) -> f64 {
     }
 }
 
-fn average_doc_len(
-    index: &InMemoryIndex,
-    index_name: &str,
-    domain: TermDomain,
-    doc_count: usize,
-) -> f64 {
-    if domain.is_prefix() || doc_count == 0 {
+fn average_doc_len(state: &IndexState, domain: TermDomain, doc_count: usize) -> f64 {
+    if doc_count == 0 {
         return 0.0;
     }
 
-    let total = index
-        .domain_total_lens
-        .get(index_name)
-        .map(|m| m.get(domain))
-        .unwrap_or(0);
+    let total = state.domain_total_len.get(domain);
     if total <= 0 {
         0.0
     } else {

@@ -23,6 +23,37 @@ mod tests {
     use std::collections::HashSet;
     use tempfile::tempdir;
 
+    // #[test]
+    // #[ignore = "only use for local load/save testing"]
+    // fn load_index_snapshot() {
+    //     let ts = std::time::Instant::now();
+    //     if let Ok(decompressed) =
+    //         zstd::stream::decode_all(std::io::Cursor::new(&include_bytes!("../index.bin")))
+    //     {
+    //         println!(
+    //             "Decompression took {:?}, {}",
+    //             ts.elapsed(),
+    //             decompressed.len()
+    //         );
+    //         let ts = std::time::Instant::now();
+    //         let config = bincode::config::standard();
+    //         let snapshot: SnapshotData = bincode::serde::decode_from_slice(&decompressed, config)
+    //             .unwrap()
+    //             .0;
+    //         println!("Deserialization took {:?}", ts.elapsed());
+    //         println!(
+    //             "docs: {}, domains: {}, total_len: {}",
+    //             snapshot.docs.len(),
+    //             snapshot.domains.len(),
+    //             snapshot.total_len
+    //         );
+    //         let ts = std::time::Instant::now();
+    //         let mut index = InMemoryIndex::default();
+    //         index.load_snapshot("test-index", snapshot);
+    //         println!("Loading into index took {:?}", ts.elapsed());
+    //     }
+    // }
+
     const INDEX: &str = "test-index";
     const DOC_CN: &str = "doc-cn";
     const DOC_EN: &str = "doc-en";
@@ -34,28 +65,6 @@ mod tests {
             "expected results to contain doc {doc_id}, got {:?}",
             results
         );
-    }
-
-    fn domain_term_dict<'a>(
-        index: &'a InMemoryIndex,
-        domain: TermDomain,
-    ) -> Option<&'a std::collections::HashSet<String>> {
-        index
-            .domains
-            .get(INDEX)
-            .and_then(|domains| domains.get(&domain))
-            .map(|d| &d.term_dict)
-    }
-
-    fn domain_ngram_index<'a>(
-        index: &'a InMemoryIndex,
-        domain: TermDomain,
-    ) -> Option<&'a std::collections::HashMap<String, Vec<String>>> {
-        index
-            .domains
-            .get(INDEX)
-            .and_then(|domains| domains.get(&domain))
-            .map(|d| &d.ngram_index)
     }
 
     #[test]
@@ -85,11 +94,18 @@ mod tests {
         assert_contains_doc(&hits, DOC_CN);
 
         let exact = index.get_matches(INDEX, DOC_CN, "nhsj");
-        let prefix = index.get_matches(INDEX, DOC_CN, "nhs");
         assert!(!exact.is_empty());
-        assert!(!prefix.is_empty());
+        let hit = index
+            .search_hits(INDEX, "nhs")
+            .into_iter()
+            .find(|h| h.doc_id == DOC_CN)
+            .expect("expected hit for prefix query");
+        let prefix_matches = index.get_matches_for_matched_terms(INDEX, DOC_CN, &hit.matched_terms);
+        assert!(!prefix_matches.is_empty());
         assert!(
-            prefix.iter().any(|p| exact.iter().any(|e| e.0 == p.0)),
+            prefix_matches
+                .iter()
+                .any(|p| exact.iter().any(|e| e.0 == p.0)),
             "prefix highlight should align to original start"
         );
     }
@@ -103,11 +119,18 @@ mod tests {
         assert_contains_doc(&hits, DOC_CN);
 
         let exact = index.get_matches(INDEX, DOC_CN, "nihaoshijie");
-        let prefix = index.get_matches(INDEX, DOC_CN, "nih");
         assert!(!exact.is_empty());
-        assert!(!prefix.is_empty());
+        let hit = index
+            .search_hits(INDEX, "nih")
+            .into_iter()
+            .find(|h| h.doc_id == DOC_CN)
+            .expect("expected hit for prefix query");
+        let prefix_matches = index.get_matches_for_matched_terms(INDEX, DOC_CN, &hit.matched_terms);
+        assert!(!prefix_matches.is_empty());
         assert!(
-            prefix.iter().any(|p| exact.iter().any(|e| e.0 == p.0)),
+            prefix_matches
+                .iter()
+                .any(|p| exact.iter().any(|e| e.0 == p.0)),
             "prefix highlight should align to original start"
         );
     }
@@ -133,17 +156,6 @@ mod tests {
             "expected SearchMode::Fuzzy to only search original domain, got {:?}",
             fuzzy_original
         );
-    }
-
-    #[test]
-    fn original_aux_index_excludes_non_ascii_terms() {
-        let mut index = InMemoryIndex::default();
-        index.add_doc(INDEX, DOC_CN, "你好世界", true);
-
-        if let Some(term_dict) = domain_term_dict(&index, TermDomain::Original) {
-            assert!(term_dict.contains("你好"));
-            assert!(term_dict.contains("世界"));
-        }
     }
 
     #[test]
@@ -425,28 +437,6 @@ mod tests {
     }
 
     #[test]
-    fn removing_doc_cleans_aux_indices() {
-        let mut index = InMemoryIndex::default();
-        index.add_doc(INDEX, DOC_EN, "token removal check", true);
-
-        index.remove_doc(INDEX, DOC_EN);
-
-        if let Some(term_dict) = domain_term_dict(&index, TermDomain::Original) {
-            assert!(
-                !term_dict.contains("token"),
-                "term_dict should drop removed terms"
-            );
-        }
-
-        if let Some(ngram_index) = domain_ngram_index(&index, TermDomain::Original) {
-            let still_contains = ngram_index
-                .values()
-                .any(|terms| terms.iter().any(|term| term == "token"));
-            assert!(!still_contains, "ngrams should remove term entries");
-        }
-    }
-
-    #[test]
     fn get_matches_for_terms_uses_matched_terms() {
         let mut index = InMemoryIndex::default();
         index.add_doc(INDEX, DOC_EN, "memoryIndexer", true);
@@ -465,43 +455,6 @@ mod tests {
 
         let matches = index.get_matches_for_matched_terms(INDEX, DOC_EN, &hit.matched_terms);
         assert!(!matches.is_empty(), "expected matches from matched_terms");
-    }
-
-    #[test]
-    fn snapshot_contains_aux_indices_per_domain() {
-        let mut index = InMemoryIndex::default();
-        index.add_doc(INDEX, DOC_CN, "你好世界 memory-indexer", true);
-
-        let snapshot = index
-            .get_snapshot_data(INDEX)
-            .expect("snapshot should exist");
-
-        let domains = snapshot.domains;
-        let original = domains
-            .get(&TermDomain::Original)
-            .expect("snapshot should contain original domain");
-        assert!(
-            !original.term_dict.is_empty(),
-            "expected original aux index to be persisted"
-        );
-        let pinyin_full = domains
-            .get(&TermDomain::PinyinFull)
-            .expect("snapshot should contain pinyin full domain");
-        assert!(
-            !pinyin_full.term_dict.is_empty(),
-            "expected full pinyin aux index to be persisted"
-        );
-        let pinyin_initials = domains
-            .get(&TermDomain::PinyinInitials)
-            .expect("snapshot should contain pinyin initials domain");
-        assert!(
-            !pinyin_initials.term_dict.is_empty(),
-            "expected initials pinyin aux index to be persisted"
-        );
-        assert!(
-            !pinyin_full.ngram_index.is_empty(),
-            "expected pinyin ngram index to be persisted"
-        );
     }
 
     #[test]
@@ -547,12 +500,9 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         let matched = hits.iter().find(|h| h.doc_id == DOC_CN).and_then(|h| {
-            h.matched_terms.iter().find(|t| {
-                matches!(
-                    t.domain,
-                    TermDomain::PinyinFull | TermDomain::PinyinFullPrefix
-                )
-            })
+            h.matched_terms
+                .iter()
+                .find(|t| matches!(t.domain, TermDomain::PinyinFull))
         });
         assert!(
             matched.is_some(),
@@ -646,27 +596,14 @@ mod tests {
             hits.iter().any(|hit| hit.doc_id == DOC_CN),
             "expected restored index to serve pinyin fuzzy hits"
         );
-        let restored_domains = restored
-            .domains
+        let restored_state = restored
+            .indexes
             .get(INDEX)
-            .expect("restored domains should exist");
-        let restored_full = restored_domains
-            .get(&TermDomain::PinyinFull)
-            .expect("restored snapshot should include pinyin full domain");
-        assert!(
-            !restored_full.term_dict.is_empty(),
-            "expected restored pinyin full dictionary to be populated"
-        );
+            .expect("restored index state should exist");
+        assert_eq!(restored_state.total_len, expected_total_len);
         assert_eq!(
-            restored.total_lens.get(INDEX).copied(),
-            Some(expected_total_len)
-        );
-        assert_eq!(
-            restored
-                .domain_total_lens
-                .get(INDEX)
-                .map(|d| d.get(TermDomain::Original)),
-            Some(expected_domain_len)
+            restored_state.domain_total_len.get(TermDomain::Original),
+            expected_domain_len
         );
     }
 
@@ -820,14 +757,6 @@ mod tests {
             "expected dictionary-backed search hit, got {:?}",
             hits
         );
-        if let Some(dict) = domain_term_dict(&index, TermDomain::Original) {
-            assert!(
-                dict.contains("こんにちは"),
-                "expected dictionary tokens to be indexed, got {:?}",
-                dict
-            );
-        }
-
         let mut fallback_index = InMemoryIndex::default();
         fallback_index.add_doc(INDEX, DOC_JP, "こんにちは世界", true);
         let fallback_hits =
@@ -840,7 +769,7 @@ mod tests {
     }
 
     #[test]
-    fn id_like_tokens_skip_aux_but_still_match_exact() {
+    fn id_like_tokens_match_exact() {
         let mut index = InMemoryIndex::default();
         let doc_id = "doc-id";
         let id_like = "IKPeA9Zu9eo_pXlKWVFcf";
@@ -853,24 +782,5 @@ mod tests {
             "expected exact search to hit id-like token, got {:?}",
             hits
         );
-
-        let token = id_like.to_lowercase();
-        if let Some(term_dict) = domain_term_dict(&index, TermDomain::Original) {
-            assert!(
-                !term_dict.contains(&token),
-                "id-like tokens should skip fuzzy aux dictionary, got {:?}",
-                term_dict
-            );
-        }
-        if let Some(ngram_index) = domain_ngram_index(&index, TermDomain::Original) {
-            let contains = ngram_index
-                .values()
-                .any(|terms| terms.iter().any(|t| t == &token));
-            assert!(
-                !contains,
-                "id-like tokens should skip ngram aux indexing, got {:?}",
-                ngram_index
-            );
-        }
     }
 }

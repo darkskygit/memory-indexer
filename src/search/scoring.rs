@@ -3,10 +3,11 @@ use std::collections::{HashMap, HashSet};
 use super::{
     super::{
         ngram::{DEFAULT_FUZZY_PARAMS, collect_fuzzy_candidates},
-        types::{DocData, DomainIndex},
+        types::{DocData, DocId, DomainIndex, TermId},
     },
     MatchedTerm, SearchHit, TermDomain,
 };
+use smol_str::SmolStr;
 
 // Standard BM25 defaults that balance term frequency and doc length without over-penalizing short docs.
 pub(super) const BM25_K1: f64 = 1.2;
@@ -56,60 +57,82 @@ pub(super) fn has_minimum_should_match(results: &[SearchHit], query_terms: usize
 }
 
 pub(super) fn score_fuzzy_terms(
-    docs: &HashMap<String, DocData>,
+    docs: &[Option<DocData>],
     domain_index: &DomainIndex,
+    term_ids: &[TermId],
+    terms: &[SmolStr],
+    ngram_index: &HashMap<SmolStr, Vec<TermId>>,
     n: f64,
     avgdl: f64,
-    doc_scores: &mut HashMap<String, f64>,
-    matched_terms: &mut HashMap<String, HashSet<MatchedTerm>>,
-    matched_query_tokens: &mut HashMap<String, HashSet<usize>>,
+    doc_scores: &mut HashMap<DocId, f64>,
+    matched_terms: &mut HashMap<DocId, HashSet<MatchedTerm>>,
+    matched_query_tokens: &mut HashMap<DocId, HashSet<usize>>,
     tokens_with_candidates: &mut HashSet<usize>,
     domain: TermDomain,
     weight: f64,
     query_term: &str,
-    doc_len_for_domain: &dyn Fn(&DocData) -> f64,
     query_idx: usize,
+    exact_term: Option<TermId>,
 ) {
     let candidates = collect_fuzzy_candidates(
-        &domain_index.ngram_index,
-        &domain_index.term_dict,
+        ngram_index,
+        term_ids,
+        terms,
         query_term,
         DEFAULT_FUZZY_PARAMS,
+        exact_term,
     );
     if candidates.is_empty() {
         return;
     }
     tokens_with_candidates.insert(query_idx);
+
     for (candidate_term, similarity) in candidates {
-        let Some(doc_map) = domain_index.postings.get(&candidate_term) else {
+        let Some(postings) = domain_index.postings.get(&candidate_term) else {
             continue;
         };
-        if doc_map.is_empty() {
+        if postings.is_empty() {
             continue;
         }
 
-        let n_q = doc_map.len() as f64;
+        let n_q = postings.len() as f64;
         let idf = ((n - n_q + 0.5) / (n_q + 0.5) + 1.0).ln();
+        let candidate_text = terms
+            .get(candidate_term as usize)
+            .map(|term| term.as_str().to_string())
+            .unwrap_or_default();
 
-        for (doc_id, freq) in doc_map {
-            if let Some(doc_data) = docs.get(doc_id) {
-                let term_score =
-                    bm25_component(*freq as f64, doc_len_for_domain(doc_data), avgdl, idf)
-                        * weight
-                        * FUZZY_WEIGHT
-                        * similarity;
+        for posting in postings {
+            if let Some(doc_data) = docs.get(posting.doc as usize).and_then(|doc| doc.as_ref()) {
+                let term_score = bm25_component(
+                    posting.freq as f64,
+                    doc_len_for_domain(doc_data, domain),
+                    avgdl,
+                    idf,
+                ) * weight
+                    * FUZZY_WEIGHT
+                    * similarity;
                 if term_score > 0.0 {
-                    *doc_scores.entry(doc_id.clone()).or_default() += term_score;
+                    *doc_scores.entry(posting.doc).or_default() += term_score;
                     matched_terms
-                        .entry(doc_id.clone())
+                        .entry(posting.doc)
                         .or_default()
-                        .insert(MatchedTerm::new(candidate_term.clone(), domain));
+                        .insert(MatchedTerm::new(candidate_text.clone(), domain));
                     matched_query_tokens
-                        .entry(doc_id.clone())
+                        .entry(posting.doc)
                         .or_default()
                         .insert(query_idx);
                 }
             }
         }
+    }
+}
+
+fn doc_len_for_domain(doc_data: &DocData, domain: TermDomain) -> f64 {
+    let len = doc_data.domain_doc_len.get(domain);
+    if len > 0 {
+        len as f64
+    } else {
+        doc_data.doc_len as f64
     }
 }

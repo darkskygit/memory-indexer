@@ -24,15 +24,15 @@ pub fn should_derive_pinyin_for_span(text: &str, start: usize, end: usize) -> bo
     }
 
     // Heuristic: if there is Hiragana/Katakana adjacent to the span, avoid pinyin.
-    if let Some(prev) = prev_char(text, start) {
-        if is_kana(prev) {
-            return false;
-        }
+    if let Some(prev) = prev_char(text, start)
+        && is_kana(prev)
+    {
+        return false;
     }
-    if let Some(next) = next_char(text, end) {
-        if is_kana(next) {
-            return false;
-        }
+    if let Some(next) = next_char(text, end)
+        && is_kana(next)
+    {
+        return false;
     }
 
     true
@@ -80,10 +80,10 @@ pub fn build_pinyin_variants(term: &str) -> Vec<(String, String)> {
     for ch in &chars {
         if let Some(multi) = ch.to_pinyin_multi() {
             let mut options: Vec<pinyin::Pinyin> = multi.into_iter().collect();
-            if options.is_empty() {
-                if let Some(py) = ch.to_pinyin() {
-                    options.push(py);
-                }
+            if options.is_empty()
+                && let Some(py) = ch.to_pinyin()
+            {
+                options.push(py);
             }
             if options.is_empty() {
                 return Vec::new();

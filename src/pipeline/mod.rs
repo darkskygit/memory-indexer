@@ -1,9 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 mod derivers;
 mod tokenizers;
 
-pub use derivers::{NoopNgramDeriver, PassthroughNormalizer, PinyinVariantDeriver, PrefixDerivers};
+pub use derivers::{NoopNgramDeriver, PassthroughNormalizer, PinyinVariantDeriver};
 pub use tokenizers::{DefaultScriptSegmenter, DefaultTokenizer};
 
 use super::{
@@ -11,9 +11,7 @@ use super::{
         DictionaryConfig, OffsetMap, SegmentScript, Token, cjk_spans, contains_chinese_chars,
         is_cjk_char, should_derive_pinyin_for_span,
     },
-    types::{
-        NormalizedTerm, PipelineToken, Segment, TermDomain, TermFrequency, TokenDraft, TokenStream,
-    },
+    types::{NormalizedTerm, PipelineToken, Segment, TermDomain, TokenDraft, TokenStream},
 };
 
 const MAX_CJK_SPAN_DERIVATION_CHARS: usize = 32;
@@ -23,28 +21,24 @@ pub struct Pipeline {
     tokenizer: DefaultTokenizer,
     normalizer: PassthroughNormalizer,
     variant_deriver: PinyinVariantDeriver,
-    prefix_deriver: PrefixDerivers,
     ngram_deriver: NoopNgramDeriver,
 }
 
 #[derive(Clone, Copy)]
 pub struct PipelineConfig {
     pub enable_variants: bool,
-    pub enable_prefixes: bool,
 }
 
 impl PipelineConfig {
     pub fn document() -> Self {
         Self {
             enable_variants: true,
-            enable_prefixes: true,
         }
     }
 
     pub fn query() -> Self {
         Self {
             enable_variants: false,
-            enable_prefixes: false,
         }
     }
 }
@@ -64,7 +58,6 @@ impl Pipeline {
             tokenizer,
             normalizer: PassthroughNormalizer,
             variant_deriver: PinyinVariantDeriver::default(),
-            prefix_deriver: PrefixDerivers::pinyin_defaults(),
             ngram_deriver: NoopNgramDeriver,
         }
     }
@@ -103,7 +96,6 @@ impl Pipeline {
         }
 
         let mut tokens = Vec::new();
-        let mut term_freqs: HashMap<String, TermFrequency> = HashMap::new();
         let mut covered_cjk_spans: HashSet<(usize, usize)> = HashSet::new();
 
         let mut doc_len: i64 = 0;
@@ -116,7 +108,6 @@ impl Pipeline {
                 let span = norm.span;
                 push_token(
                     &mut tokens,
-                    &mut term_freqs,
                     PipelineToken {
                         term: norm.term.clone(),
                         span,
@@ -133,7 +124,7 @@ impl Pipeline {
                     && contains_chinese_chars(&norm.term)
                     && should_derive_pinyin_for_span(text, span.0, span.1)
                 {
-                    self.derive_variants(&norm, &config, &mut tokens, &mut term_freqs);
+                    self.derive_variants(&norm, &mut tokens);
                 }
             }
         }
@@ -157,48 +148,24 @@ impl Pipeline {
                     script: SegmentScript::Han,
                     mapping: OffsetMap::identity(span),
                 };
-                self.derive_variants(&norm, &config, &mut tokens, &mut term_freqs);
+                self.derive_variants(&norm, &mut tokens);
             }
         }
 
-        TokenStream {
-            tokens,
-            term_freqs,
-            doc_len,
-        }
+        TokenStream { tokens, doc_len }
     }
 
-    fn derive_variants(
-        &self,
-        term: &NormalizedTerm,
-        config: &PipelineConfig,
-        tokens: &mut Vec<PipelineToken>,
-        term_freqs: &mut HashMap<String, TermFrequency>,
-    ) {
+    fn derive_variants(&self, term: &NormalizedTerm, tokens: &mut Vec<PipelineToken>) {
         for variant in self.variant_deriver.derive(term) {
-            push_token(tokens, term_freqs, variant.clone());
-
-            if config.enable_prefixes {
-                for prefix in self.prefix_deriver.derive_prefixes(&variant, term_freqs) {
-                    push_token(tokens, term_freqs, prefix);
-                }
-            }
+            push_token(tokens, variant.clone());
 
             for ngram in self.ngram_deriver.derive_ngrams(&variant) {
-                push_token(tokens, term_freqs, ngram);
+                push_token(tokens, ngram);
             }
         }
     }
 }
 
-fn push_token(
-    tokens: &mut Vec<PipelineToken>,
-    term_freqs: &mut HashMap<String, TermFrequency>,
-    token: PipelineToken,
-) {
-    term_freqs
-        .entry(token.term.clone())
-        .or_default()
-        .increment(token.domain);
+fn push_token(tokens: &mut Vec<PipelineToken>, token: PipelineToken) {
     tokens.push(token);
 }
