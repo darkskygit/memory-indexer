@@ -206,6 +206,39 @@ impl DefaultTextNormalizer {
         })
     }
 
+    fn normalize_unicode_split(
+        raw: &str,
+        base_start: usize,
+        script: SegmentScript,
+        out: &mut Vec<TokenWithScript>,
+        seen: &mut HashSet<(String, usize, usize)>,
+    ) {
+        let chars: Vec<(usize, char)> = raw.char_indices().collect();
+        let len = chars.len();
+        let mut i = 0;
+
+        while i < len {
+            while i < len && !(chars[i].1.is_alphanumeric() || is_combining_mark(chars[i].1)) {
+                i += 1;
+            }
+            if i >= len {
+                break;
+            }
+
+            let start_char = i;
+            while i < len && (chars[i].1.is_alphanumeric() || is_combining_mark(chars[i].1)) {
+                i += 1;
+            }
+
+            let start = chars[start_char].0;
+            let end = if i < len { chars[i].0 } else { raw.len() };
+
+            if let Some(token) = Self::normalize_span(&raw[start..end], base_start + start, script) {
+                Self::push_token(out, seen, token);
+            }
+        }
+    }
+
     fn normalize_text(raw: &str, base_start: usize) -> (String, Vec<usize>) {
         let mut normalized = String::new();
         let mut mapping = Vec::new();
@@ -249,6 +282,11 @@ impl TextNormalizer for DefaultTextNormalizer {
     ) {
         if raw.is_ascii() {
             Self::normalize_ascii_split(raw, base_start, script, out, seen);
+            return;
+        }
+
+        if matches!(script, SegmentScript::Other) {
+            Self::normalize_unicode_split(raw, base_start, script, out, seen);
             return;
         }
 
