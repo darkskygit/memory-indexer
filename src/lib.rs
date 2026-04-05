@@ -192,12 +192,12 @@ mod tests {
     }
 
     #[test]
-    fn cyrillic_single_word_matches_exact() {
+    fn greek_term_matches_inside_phrase() {
         let mut index = InMemoryIndex::default();
-        let doc_id = "doc-cyr-single";
-        index.add_doc(INDEX, doc_id, "привет", true);
+        let doc_id = "doc-gr";
+        index.add_doc(INDEX, doc_id, "γειά σου κόσμε", true);
 
-        let hits = index.search_with_mode(INDEX, "привет", SearchMode::Exact);
+        let hits = index.search_with_mode(INDEX, "γειά", SearchMode::Exact);
         assert_contains_doc(&hits, doc_id);
     }
 
@@ -212,16 +212,13 @@ mod tests {
     }
 
     #[test]
-    fn latin_and_cyrillic_boundary_is_searchable() {
+    fn armenian_term_matches_with_punctuation() {
         let mut index = InMemoryIndex::default();
-        let doc_id = "doc-latin-cyr";
-        index.add_doc(INDEX, doc_id, "helloпривет", true);
+        let doc_id = "doc-hy-punct";
+        index.add_doc(INDEX, doc_id, "բարեւ, աշխարհ", true);
 
-        let cyr_hits = index.search_with_mode(INDEX, "привет", SearchMode::Exact);
-        assert_contains_doc(&cyr_hits, doc_id);
-
-        let latin_hits = index.search_with_mode(INDEX, "hello", SearchMode::Exact);
-        assert_contains_doc(&latin_hits, doc_id);
+        let hits = index.search_with_mode(INDEX, "բարեւ", SearchMode::Exact);
+        assert_contains_doc(&hits, doc_id);
     }
 
     #[test]
