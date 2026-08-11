@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-
 /// Search execution strategy for a query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SearchMode {
