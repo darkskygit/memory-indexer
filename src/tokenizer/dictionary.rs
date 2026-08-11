@@ -436,6 +436,6 @@ mod tests {
     }
 
     fn to_io_err(err: impl std::fmt::Display) -> std::io::Error {
-        std::io::Error::new(std::io::ErrorKind::Other, err.to_string())
+        std::io::Error::other(err.to_string())
     }
 }

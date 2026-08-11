@@ -8,8 +8,8 @@ pub use tokenizers::{DefaultScriptSegmenter, DefaultTokenizer};
 
 use super::{
     tokenizer::{
-        DictionaryConfig, OffsetMap, SegmentScript, Token, cjk_spans, contains_chinese_chars,
-        is_cjk_char, should_derive_pinyin_for_span,
+        OffsetMap, SegmentScript, cjk_spans, contains_chinese_chars, is_cjk_char,
+        should_derive_pinyin_for_span,
     },
     types::{NormalizedTerm, PipelineToken, Segment, TermDomain, TokenDraft, TokenStream},
 };
@@ -62,23 +62,6 @@ impl Pipeline {
         }
     }
 
-    pub fn with_dictionary(dictionary: DictionaryConfig) -> Self {
-        Self::new(DefaultTokenizer::for_documents().with_dictionary(dictionary))
-    }
-
-    pub fn tokenize_query(text: &str) -> Vec<Token> {
-        Self::query_pipeline()
-            .query_tokens(text)
-            .tokens
-            .into_iter()
-            .map(|token| Token {
-                term: token.term,
-                start: token.span.0,
-                end: token.span.1,
-            })
-            .collect()
-    }
-
     pub fn document_tokens(&self, text: &str) -> TokenStream {
         self.run(text, PipelineConfig::document())
     }
@@ -98,11 +81,8 @@ impl Pipeline {
         let mut tokens = Vec::new();
         let mut covered_cjk_spans: HashSet<(usize, usize)> = HashSet::new();
 
-        let mut doc_len: i64 = 0;
-
         for draft in &drafts {
             let normalized = self.normalizer.normalize(draft);
-            doc_len += normalized.len() as i64;
 
             for norm in normalized {
                 let span = norm.span;
@@ -152,7 +132,7 @@ impl Pipeline {
             }
         }
 
-        TokenStream { tokens, doc_len }
+        TokenStream { tokens }
     }
 
     fn derive_variants(&self, term: &NormalizedTerm, tokens: &mut Vec<PipelineToken>) {

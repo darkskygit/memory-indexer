@@ -9,7 +9,6 @@ mod pinyin;
 mod script;
 
 pub use dictionary::{DictionaryConfig, DictionarySegmenter};
-pub use normalize::is_ascii_id_like;
 pub use normalize::{TextNormalizer, TextNormalizerRef, normalize_query, normalize_term};
 pub use pinyin::{
     build_pinyin_variants, cjk_spans, contains_chinese_chars, should_derive_pinyin_for_span,

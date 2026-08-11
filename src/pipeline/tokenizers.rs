@@ -2,10 +2,10 @@ use std::collections::{HashMap, HashSet};
 
 use super::{
     super::tokenizer::{
-        DictionarySegmenter, TextNormalizer, TextNormalizerRef, normalize_query, normalize_term,
-        script_runs, tokenize_chinese, tokenize_hangul, tokenize_japanese,
+        DictionaryConfig, DictionarySegmenter, TextNormalizer, TextNormalizerRef, normalize_query,
+        normalize_term, script_runs, tokenize_chinese, tokenize_hangul, tokenize_japanese,
     },
-    DictionaryConfig, Segment, SegmentScript, TokenDraft,
+    Segment, SegmentScript, TokenDraft,
 };
 
 pub trait ScriptTokenizerStrategy {

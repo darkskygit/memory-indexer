@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
-use super::tokenizer::is_ascii_id_like;
-use super::types::TermId;
+use super::index::TermId;
 
 use smol_str::SmolStr;
 use strsim::normalized_levenshtein;
@@ -19,23 +18,6 @@ pub const DEFAULT_FUZZY_PARAMS: FuzzyParams = FuzzyParams {
     max_candidates: 20,
     max_len_diff: 2,
 };
-
-pub fn build_ngram_index(term_ids: &[TermId], terms: &[SmolStr]) -> HashMap<SmolStr, Vec<TermId>> {
-    let mut index: HashMap<SmolStr, Vec<TermId>> = HashMap::new();
-    for &term_id in term_ids {
-        let Some(term) = terms.get(term_id as usize) else {
-            continue;
-        };
-        for gram in generate_ngrams(term.as_str()) {
-            if let Some(entries) = index.get_mut(gram.as_str()) {
-                entries.push(term_id);
-            } else {
-                index.insert(SmolStr::new(gram), vec![term_id]);
-            }
-        }
-    }
-    index
-}
 
 pub fn collect_fuzzy_candidates(
     ngram_index: &HashMap<SmolStr, Vec<TermId>>,
@@ -65,7 +47,7 @@ pub fn collect_fuzzy_candidates(
     }
 
     let mut ranked: Vec<(TermId, usize)> = counts.into_iter().collect();
-    ranked.sort_by(|a, b| b.1.cmp(&a.1));
+    ranked.sort_by_key(|item| std::cmp::Reverse(item.1));
     ranked.truncate(params.max_candidates.saturating_mul(2));
 
     let mut filtered = Vec::new();
@@ -134,8 +116,4 @@ fn length_gap_exceeds(a: usize, b: usize, max_gap: usize) -> bool {
 
 fn fuzzy_threshold(term_len: usize, base: f64) -> f64 {
     if term_len <= 2 { base.min(0.5) } else { base }
-}
-
-pub fn should_index_in_original_aux(term: &str) -> bool {
-    term.chars().any(|c| c.is_alphanumeric()) && !is_ascii_id_like(term)
 }

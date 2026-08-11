@@ -78,23 +78,6 @@ impl IdLikeDetector {
     }
 }
 
-/// Heuristic detector for high-entropy ASCII ids (UUID/nanoid-like) to avoid fuzzy indexing overhead.
-#[inline]
-pub fn is_ascii_id_like(token: &str) -> bool {
-    let mut stats = IdLikeDetector::default();
-    for &b in token.as_bytes() {
-        if !stats.push(b) {
-            return false;
-        }
-    }
-
-    if stats.len < ID_LIKE_MIN_LEN {
-        return false;
-    }
-
-    stats.is_id_like()
-}
-
 impl DefaultTextNormalizer {
     fn normalize_ascii_split(
         raw: &str,
@@ -233,7 +216,8 @@ impl DefaultTextNormalizer {
             let start = chars[start_char].0;
             let end = if i < len { chars[i].0 } else { raw.len() };
 
-            if let Some(token) = Self::normalize_span(&raw[start..end], base_start + start, script) {
+            if let Some(token) = Self::normalize_span(&raw[start..end], base_start + start, script)
+            {
                 Self::push_token(out, seen, token);
             }
         }

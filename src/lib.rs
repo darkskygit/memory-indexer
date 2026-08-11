@@ -1,826 +1,342 @@
-mod base;
+mod checkpoint;
+mod document;
+mod error;
 mod index;
 mod ngram;
 mod pipeline;
+mod schema;
 mod search;
 mod tokenizer;
 mod types;
 
-pub use types::{
-    DocData, InMemoryIndex, PositionEncoding, SNAPSHOT_VERSION, SearchHit, SearchMode,
-    SnapshotData, TermDomain,
+pub use checkpoint::Checkpoint;
+pub use document::{BatchResult, Document, Mutation, MutationResult, Value};
+pub use error::{Error, Result};
+pub use index::optimize::OptimizeResult;
+pub use schema::{Field, FieldId, FieldOptions, FieldType, Schema, SchemaBuilder, TextOptions};
+pub use search::{
+    AggregationResult, Bucket, Highlight, Query, SearchHit, SearchOptions, SearchResult, Sort,
+    SortOrder, SortValue, TermsAggregation,
 };
-
 pub use tokenizer::dictionary::{
     DictionaryConfig, DictionaryLanguage, DictionarySegmenter, ScriptDictionary,
     train_dictionary_config,
 };
+pub use types::{PositionEncoding, SearchMode};
+
+use index::MemoryIndexState;
+
+#[derive(Debug)]
+pub struct MemoryIndex {
+    schema: Schema,
+    state: MemoryIndexState,
+}
+
+impl MemoryIndex {
+    pub fn new(schema: Schema) -> Self {
+        Self {
+            state: MemoryIndexState::new(&schema),
+            schema,
+        }
+    }
+
+    pub fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    pub fn len(&self) -> usize {
+        self.state.live_docs.len() as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.state.live_docs.is_empty()
+    }
+}
 
 #[cfg(test)]
 mod tests {
-    use super::types::MatchedTerm;
     use super::*;
-    use std::collections::HashSet;
-    use tempfile::tempdir;
 
-    // #[test]
-    // #[ignore = "only use for local load/save testing"]
-    // fn load_index_snapshot() {
-    //     let ts = std::time::Instant::now();
-    //     if let Ok(decompressed) =
-    //         zstd::stream::decode_all(std::io::Cursor::new(&include_bytes!("../index.bin")))
-    //     {
-    //         println!(
-    //             "Decompression took {:?}, {}",
-    //             ts.elapsed(),
-    //             decompressed.len()
-    //         );
-    //         let ts = std::time::Instant::now();
-    //         let config = bincode::config::standard();
-    //         let snapshot: SnapshotData = bincode::serde::decode_from_slice(&decompressed, config)
-    //             .unwrap()
-    //             .0;
-    //         println!("Deserialization took {:?}", ts.elapsed());
-    //         println!(
-    //             "docs: {}, domains: {}, total_len: {}",
-    //             snapshot.docs.len(),
-    //             snapshot.domains.len(),
-    //             snapshot.total_len
-    //         );
-    //         let ts = std::time::Instant::now();
-    //         let mut index = InMemoryIndex::default();
-    //         index.load_snapshot("test-index", snapshot);
-    //         println!("Loading into index took {:?}", ts.elapsed());
-    //     }
-    // }
+    struct Fixture {
+        schema: Schema,
+        workspace: FieldId,
+        content: FieldId,
+        rank: FieldId,
+        active: FieldId,
+    }
 
-    const INDEX: &str = "test-index";
-    const DOC_CN: &str = "doc-cn";
-    const DOC_EN: &str = "doc-en";
-    const DOC_JP: &str = "doc-jp";
-
-    fn assert_contains_doc(results: &[(String, f64)], doc_id: &str) {
-        assert!(
-            results.iter().any(|(id, _)| id == doc_id),
-            "expected results to contain doc {doc_id}, got {:?}",
-            results
+    fn fixture(encoding: PositionEncoding) -> Fixture {
+        let mut builder = Schema::builder().position_encoding(encoding);
+        let workspace = builder.keyword("workspace", FieldOptions::indexed_stored().multi_value());
+        let content = builder.text(
+            "content",
+            TextOptions::multilingual()
+                .with_pinyin()
+                .with_prefix()
+                .with_fuzzy()
+                .with_positions(),
+            FieldOptions::indexed_stored().multi_value(),
         );
+        let rank = builder.i64("rank", FieldOptions::indexed_stored().sortable());
+        let active = builder.bool("active", FieldOptions::indexed_stored().sortable());
+        Fixture {
+            schema: builder.build().unwrap(),
+            workspace,
+            content,
+            rank,
+            active,
+        }
+    }
+
+    fn document(
+        fixture: &Fixture,
+        id: &str,
+        workspace: &str,
+        content: &str,
+        rank: i64,
+    ) -> Document {
+        let mut document = Document::new(id);
+        document.add(fixture.workspace, workspace);
+        document.add(fixture.content, content);
+        document.add(fixture.rank, rank);
+        document.add(fixture.active, true);
+        document
+    }
+
+    fn ids(result: SearchResult) -> Vec<String> {
+        result.hits.into_iter().map(|hit| hit.id).collect()
     }
 
     #[test]
-    fn chinese_full_pinyin_search() {
-        let mut index = InMemoryIndex::default();
-        index.add_doc(INDEX, DOC_CN, "你好世界", true);
-
-        let hits = index.search(INDEX, "nihao");
-        assert_contains_doc(&hits, DOC_CN);
-    }
-
-    #[test]
-    fn chinese_initials_search() {
-        let mut index = InMemoryIndex::default();
-        index.add_doc(INDEX, DOC_CN, "你好世界", true);
-
-        let hits = index.search(INDEX, "nh");
-        assert_contains_doc(&hits, DOC_CN);
-    }
-
-    #[test]
-    fn chinese_initials_prefix_search() {
-        let mut index = InMemoryIndex::default();
-        index.add_doc(INDEX, DOC_CN, "你好世界", true);
-
-        let hits = index.search(INDEX, "nhs");
-        assert_contains_doc(&hits, DOC_CN);
-
-        let exact = index.get_matches(INDEX, DOC_CN, "nhsj");
-        assert!(!exact.is_empty());
-        let hit = index
-            .search_hits(INDEX, "nhs")
-            .into_iter()
-            .find(|h| h.doc_id == DOC_CN)
-            .expect("expected hit for prefix query");
-        let prefix_matches = index.get_matches_for_matched_terms(INDEX, DOC_CN, &hit.matched_terms);
-        assert!(!prefix_matches.is_empty());
-        assert!(
-            prefix_matches
-                .iter()
-                .any(|p| exact.iter().any(|e| e.0 == p.0)),
-            "prefix highlight should align to original start"
-        );
-    }
-
-    #[test]
-    fn chinese_full_pinyin_prefix_search() {
-        let mut index = InMemoryIndex::default();
-        index.add_doc(INDEX, DOC_CN, "你好世界", true);
-
-        let hits = index.search(INDEX, "nih");
-        assert_contains_doc(&hits, DOC_CN);
-
-        let exact = index.get_matches(INDEX, DOC_CN, "nihaoshijie");
-        assert!(!exact.is_empty());
-        let hit = index
-            .search_hits(INDEX, "nih")
-            .into_iter()
-            .find(|h| h.doc_id == DOC_CN)
-            .expect("expected hit for prefix query");
-        let prefix_matches = index.get_matches_for_matched_terms(INDEX, DOC_CN, &hit.matched_terms);
-        assert!(!prefix_matches.is_empty());
-        assert!(
-            prefix_matches
-                .iter()
-                .any(|p| exact.iter().any(|e| e.0 == p.0)),
-            "prefix highlight should align to original start"
-        );
-    }
-
-    #[test]
-    fn pinyin_fuzzy_search() {
-        let mut index = InMemoryIndex::default();
-        index.add_doc(INDEX, DOC_CN, "你好世界", true);
-
-        let hits = index.search_hits(INDEX, "nihap");
-        assert!(
-            hits.iter()
-                .any(|h| h.doc_id == DOC_CN && !h.matched_terms.is_empty()),
-            "expected matched pinyin term in fuzzy hits: {:?}",
-            hits.iter()
-                .map(|h| (&h.doc_id, &h.matched_terms))
-                .collect::<Vec<_>>()
-        );
-
-        let fuzzy_original = index.search_with_mode(INDEX, "nihap", SearchMode::Fuzzy);
-        assert!(
-            fuzzy_original.is_empty(),
-            "expected SearchMode::Fuzzy to only search original domain, got {:?}",
-            fuzzy_original
-        );
-    }
-
-    #[test]
-    fn english_fuzzy_search() {
-        let mut index = InMemoryIndex::default();
-        index.add_doc(INDEX, DOC_EN, "fuzzy search handles typos", true);
-
-        let hits = index.search_hits(INDEX, "fuzze");
-        assert!(hits.iter().any(|h| {
-            h.doc_id == DOC_EN
-                && h.matched_terms
-                    .iter()
-                    .any(|t| t.term == "fuzzy" && t.domain == TermDomain::Original)
-        }));
-    }
-
-    #[test]
-    fn english_query_splits_separators_and_lowercases() {
-        let mut index = InMemoryIndex::default();
-        index.add_doc(INDEX, DOC_EN, "MEMORY-INDEXER", true);
-
-        let hits = index.search_with_mode(INDEX, "memory-indexer", SearchMode::Exact);
-        assert_contains_doc(&hits, DOC_EN);
-    }
-
-    #[test]
-    fn cyrillic_term_matches_inside_phrase() {
-        let mut index = InMemoryIndex::default();
-        let doc_id = "doc-ru";
-        index.add_doc(INDEX, doc_id, "привет мир", true);
-
-        let hits = index.search_with_mode(INDEX, "привет", SearchMode::Exact);
-        assert_contains_doc(&hits, doc_id);
-    }
-
-    #[test]
-    fn greek_term_matches_inside_phrase() {
-        let mut index = InMemoryIndex::default();
-        let doc_id = "doc-gr";
-        index.add_doc(INDEX, doc_id, "γειά σου κόσμε", true);
-
-        let hits = index.search_with_mode(INDEX, "γειά", SearchMode::Exact);
-        assert_contains_doc(&hits, doc_id);
-    }
-
-    #[test]
-    fn cyrillic_term_matches_with_punctuation() {
-        let mut index = InMemoryIndex::default();
-        let doc_id = "doc-ru-punct";
-        index.add_doc(INDEX, doc_id, "привет, привет", true);
-
-        let hits = index.search_with_mode(INDEX, "привет", SearchMode::Exact);
-        assert_contains_doc(&hits, doc_id);
-    }
-
-    #[test]
-    fn armenian_term_matches_with_punctuation() {
-        let mut index = InMemoryIndex::default();
-        let doc_id = "doc-hy-punct";
-        index.add_doc(INDEX, doc_id, "բարեւ, աշխարհ", true);
-
-        let hits = index.search_with_mode(INDEX, "բարեւ", SearchMode::Exact);
-        assert_contains_doc(&hits, doc_id);
-    }
-
-    #[test]
-    fn fuzzy_search_allows_alphanumeric_terms() {
-        let mut index = InMemoryIndex::default();
-        index.add_doc(INDEX, DOC_EN, "version2 stable", true);
-
-        let hits = index.search_with_mode(INDEX, "versoin2", SearchMode::Fuzzy);
-        assert_contains_doc(&hits, DOC_EN);
-    }
-
-    #[test]
-    fn fuzzy_search_handles_separated_query_terms() {
-        let mut index = InMemoryIndex::default();
-        index.add_doc(INDEX, DOC_EN, "memory-indexer", true);
-
-        let hits = index.search_with_mode(INDEX, "memry-indexer", SearchMode::Fuzzy);
-        assert_contains_doc(&hits, DOC_EN);
-    }
-
-    #[test]
-    fn fuzzy_search_handles_short_terms() {
-        let mut index = InMemoryIndex::default();
-        index.add_doc(INDEX, DOC_EN, "go go", true);
-
-        let hits = index.search_with_mode(INDEX, "go", SearchMode::Fuzzy);
-        assert_contains_doc(&hits, DOC_EN);
-    }
-
-    #[test]
-    fn pinyin_highlight_uses_original_positions() {
-        let mut index = InMemoryIndex::default();
-        index.add_doc(INDEX, DOC_CN, "你好世界", true);
-
-        let direct = index.get_matches(INDEX, DOC_CN, "你好");
-        assert!(
-            !direct.is_empty(),
-            "expected direct chinese match to have positions"
-        );
-
-        let pinyin = index.get_matches(INDEX, DOC_CN, "nihao");
-        assert_eq!(pinyin, direct);
-    }
-
-    #[test]
-    fn highlight_prefers_original_for_mixed_scripts() {
-        let mut index = InMemoryIndex::default();
-        index.add_doc(INDEX, DOC_CN, "hello 世界", true);
-
-        let hits = index.search_hits(INDEX, "hello shi");
-        let Some(hit) = hits.iter().find(|h| h.doc_id == DOC_CN) else {
-            panic!("expected hit for mixed script query");
-        };
-        let matches = index.get_matches_for_matched_terms(INDEX, DOC_CN, &hit.matched_terms);
-        let content = index.get_doc(INDEX, DOC_CN).unwrap();
-        let slices: Vec<String> = matches
-            .iter()
-            .map(|(s, e)| utf16_slice(&content, *s, *e))
-            .collect();
-        assert!(
-            slices.iter().any(|s| s == "hello"),
-            "expected original spans for mixed script matches, got {:?}",
-            slices
-        );
-        if slices.iter().any(|s| s.chars().any(|c| !c.is_ascii())) {
-            assert!(
-                slices.iter().any(|s| s == "世界"),
-                "expected CJK spans for mixed script matches, got {:?}",
-                slices
-            );
+    fn multilingual_and_pinyin_semantics() {
+        let cases = [
+            (
+                "latin",
+                "fuzzy search handles typos",
+                "fuzze",
+                SearchMode::Auto,
+            ),
+            ("chinese-full", "你好世界", "nihao", SearchMode::Auto),
+            ("chinese-initial", "你好世界", "nhs", SearchMode::Auto),
+            ("japanese", "検索エンジン", "検索", SearchMode::Exact),
+            ("korean", "검색 엔진", "검색", SearchMode::Exact),
+            (
+                "mixed",
+                "memory 搜索 engine",
+                "memory 搜索",
+                SearchMode::Exact,
+            ),
+            ("polyphonic", "重庆银行", "chongqing", SearchMode::Auto),
+        ];
+        for (id, text, query, mode) in cases {
+            let fixture = fixture(PositionEncoding::Bytes);
+            let mut index = MemoryIndex::new(fixture.schema.clone());
+            index
+                .upsert(document(&fixture, id, "workspace-1", text, 1))
+                .unwrap();
+            let result = index
+                .search(
+                    &Query::text(fixture.content, query, mode),
+                    SearchOptions::new(10),
+                )
+                .unwrap();
+            assert_eq!(ids(result), vec![id], "case {id}");
         }
     }
 
     #[test]
-    fn pinyin_prefix_highlight_uses_original_spans() {
-        let mut index = InMemoryIndex::default();
-        index.add_doc(INDEX, DOC_CN, "你好世界", true);
-
-        let hits = index.search_hits(INDEX, "nih");
-        let Some(hit) = hits.iter().find(|h| h.doc_id == DOC_CN) else {
-            panic!("expected prefix pinyin hit");
-        };
-        let matches = index.get_matches_for_matched_terms(INDEX, DOC_CN, &hit.matched_terms);
-        let direct = index.get_matches(INDEX, DOC_CN, "你好");
+    fn keyword_is_exact_case_sensitive_and_deduplicated() {
+        let fixture = fixture(PositionEncoding::Bytes);
+        let mut index = MemoryIndex::new(fixture.schema.clone());
+        let mut first = document(&fixture, "one", "workspace-1", "search", 1);
+        first.add(fixture.workspace, "workspace-1");
+        index.upsert(first).unwrap();
+        index
+            .upsert(document(&fixture, "two", "workspace-2", "search", 2))
+            .unwrap();
         assert_eq!(
-            matches, direct,
-            "prefix highlight should map back to original spans"
+            ids(index
+                .search(
+                    &Query::term(fixture.workspace, "workspace-1"),
+                    SearchOptions::new(10)
+                )
+                .unwrap()),
+            vec!["one"]
+        );
+        assert!(
+            index
+                .search(
+                    &Query::term(fixture.workspace, "Workspace-1"),
+                    SearchOptions::new(10)
+                )
+                .unwrap()
+                .hits
+                .is_empty()
         );
     }
 
     #[test]
-    fn pinyin_highlight_handles_trailing_ascii() {
-        let mut index = InMemoryIndex::with_position_encoding(PositionEncoding::Utf16);
-        index.add_doc(
-            INDEX,
-            DOC_CN,
-            "美光将在全球内存供应短缺之际退出消费级内存业务",
-            true,
-        );
-
-        let hits = index.search_hits(INDEX, "neicun");
-        let hit = hits
-            .iter()
-            .find(|h| h.doc_id == DOC_CN)
-            .unwrap_or_else(|| panic!("expected hit for neicun, got {:?}", hits));
-        let matches = index.get_matches_for_matched_terms(INDEX, DOC_CN, &hit.matched_terms);
-        assert!(
-            !matches.is_empty(),
-            "expected highlight spans for pinyin match, got none"
-        );
-        let content = index.get_doc(INDEX, DOC_CN).unwrap();
-        let slices: Vec<String> = matches
-            .iter()
-            .map(|(s, e)| utf16_slice(&content, *s, *e))
-            .collect();
-        assert!(
-            slices.iter().all(|s| s == "内存"),
-            "expected highlights to stay on original term, got {:?}",
-            slices
-        );
-    }
-
-    fn utf16_slice(content: &str, start: u32, end: u32) -> String {
-        let mut utf16_pos = 0u32;
-        let mut start_byte = 0usize;
-        let mut end_byte = content.len();
-        for (idx, ch) in content.char_indices() {
-            if utf16_pos == start {
-                start_byte = idx;
-            }
-            utf16_pos += ch.len_utf16() as u32;
-            if utf16_pos == end {
-                end_byte = idx + ch.len_utf8();
-                break;
-            }
+    fn boolean_top_k_fields_highlight_and_search_after() {
+        let fixture = fixture(PositionEncoding::Utf16);
+        let mut index = MemoryIndex::new(fixture.schema.clone());
+        for (id, workspace, text, rank) in [
+            ("a", "w1", "你好 search", 3),
+            ("b", "w1", "search", 2),
+            ("c", "w2", "search", 1),
+        ] {
+            index
+                .upsert(document(&fixture, id, workspace, text, rank))
+                .unwrap();
         }
-        content[start_byte..end_byte].to_string()
-    }
-
-    #[test]
-    fn exact_search_prefers_original_terms() {
-        let mut index = InMemoryIndex::default();
-        index.add_doc(INDEX, DOC_EN, "nihao greeting", true);
-        index.add_doc(INDEX, DOC_CN, "你好世界", true);
-
-        let exact_hits = index.search_with_mode(INDEX, "nihao", SearchMode::Exact);
-        assert_contains_doc(&exact_hits, DOC_EN);
-        assert!(
-            exact_hits.iter().all(|(id, _)| id == DOC_EN),
-            "expected exact search to ignore pinyin matches, got {:?}",
-            exact_hits
+        let query = Query::boolean(
+            vec![
+                Query::term(fixture.workspace, "w1"),
+                Query::text(fixture.content, "search", SearchMode::Exact),
+            ],
+            vec![],
+            vec![Query::term(fixture.rank, 99i64)],
         );
-
-        let auto_hits = index.search(INDEX, "nihao");
-        assert_contains_doc(&auto_hits, DOC_EN);
-        assert!(
-            auto_hits.iter().all(|(id, _)| id != DOC_CN),
-            "auto search should stop at exact matches"
-        );
-
-        let pinyin_hits = index.search_with_mode(INDEX, "nihao", SearchMode::Pinyin);
-        assert_contains_doc(&pinyin_hits, DOC_CN);
-    }
-
-    #[test]
-    fn japanese_ngram_search() {
-        let mut index = InMemoryIndex::default();
-        index.add_doc(INDEX, DOC_JP, "こんにちは世界", true);
-
-        let hits = index.search(INDEX, "こん");
-        assert_contains_doc(&hits, DOC_JP);
-
-        let matches = index.get_matches(INDEX, DOC_JP, "こん");
-        assert!(
-            !matches.is_empty(),
-            "expected offsets for japanese ngram matches"
-        );
-    }
-
-    #[test]
-    fn kanji_adjacent_to_kana_skips_pinyin() {
-        let mut index = InMemoryIndex::default();
-        index.add_doc(INDEX, DOC_JP, "東京へようこそ", true);
-
-        let hits = index.search_with_mode(INDEX, "dongjing", SearchMode::Pinyin);
-        assert!(
-            hits.is_empty(),
-            "kanji near kana should not derive pinyin, got {:?}",
-            hits
-        );
-    }
-
-    #[test]
-    fn exact_search_applies_minimum_should_match() {
-        let mut index = InMemoryIndex::default();
-        index.add_doc(INDEX, "doc-2-terms", "apple banana", true);
-        index.add_doc(INDEX, "doc-3-terms", "apple banana cherry", true);
-        index.add_doc(INDEX, "doc-1-term", "apple", true);
-
-        let hits = index.search_with_mode(INDEX, "apple banana cherry", SearchMode::Exact);
-
-        assert_contains_doc(&hits, "doc-2-terms");
-        assert_contains_doc(&hits, "doc-3-terms");
-        assert!(
-            !hits.iter().any(|(id, _)| id == "doc-1-term"),
-            "docs below minimum_should_match should be filtered out"
-        );
-
-        let score_two = hits
-            .iter()
-            .find(|(id, _)| id == "doc-2-terms")
-            .map(|(_, s)| *s)
-            .unwrap();
-        let score_three = hits
-            .iter()
-            .find(|(id, _)| id == "doc-3-terms")
-            .map(|(_, s)| *s)
-            .unwrap();
-        assert!(
-            score_three > score_two,
-            "more matched terms should score higher: {} vs {}",
-            score_three,
-            score_two
-        );
-    }
-
-    #[test]
-    fn pinyin_polyphonic_variants_for_short_tokens() {
-        let mut index = InMemoryIndex::default();
-        index.add_doc(INDEX, DOC_CN, "重庆火锅", true);
-
-        let hits_zhong = index.search_with_mode_hits(INDEX, "zhongqing", SearchMode::Pinyin);
-        assert!(
-            hits_zhong.iter().any(|h| h.doc_id == DOC_CN),
-            "expected zhongqing variant to hit"
-        );
-
-        let hits_chong = index.search_with_mode_hits(INDEX, "chongqing", SearchMode::Pinyin);
-        assert!(
-            hits_chong.iter().any(|h| h.doc_id == DOC_CN),
-            "expected chongqing variant to hit"
-        );
-
-        let matched_terms: Vec<MatchedTerm> = hits_zhong
-            .into_iter()
-            .find(|h| h.doc_id == DOC_CN)
-            .map(|h| h.matched_terms)
-            .unwrap_or_default();
-        assert!(
-            matched_terms
-                .iter()
-                .any(|t| t.term.contains("zhongqing") || t.term.contains("chongqing")),
-            "expected polyphonic pinyin variants in matched_terms, got {:?}",
-            matched_terms
-        );
-    }
-
-    #[test]
-    fn get_matches_for_terms_uses_matched_terms() {
-        let mut index = InMemoryIndex::default();
-        index.add_doc(INDEX, DOC_EN, "memoryIndexer", true);
-
-        let hits = index.search_hits(INDEX, "memryindexer");
-        let Some(hit) = hits.iter().find(|h| h.doc_id == DOC_EN) else {
-            panic!("expected hit for doc");
+        let options = SearchOptions {
+            limit: 1,
+            offset: 0,
+            after: None,
+            sort: vec![Sort::Field {
+                field: fixture.rank,
+                order: SortOrder::Desc,
+            }],
+            stored_fields: vec![fixture.content, fixture.rank],
+            highlight_fields: vec![fixture.content],
         };
-        assert!(
-            hit.matched_terms
-                .iter()
-                .any(|t| t.term == "memoryindexer" && t.domain == TermDomain::Original),
-            "expected matched term memoryIndexer, got {:?}",
-            hit.matched_terms
-        );
-
-        let matches = index.get_matches_for_matched_terms(INDEX, DOC_EN, &hit.matched_terms);
-        assert!(!matches.is_empty(), "expected matches from matched_terms");
-    }
-
-    #[test]
-    fn fullwidth_pinyin_query_hits() {
-        let mut index = InMemoryIndex::default();
-        index.add_doc(INDEX, DOC_CN, "你好世界", true);
-
-        // Full-width ASCII should normalize to ASCII and derive pinyin.
-        let hits = index.search_hits(INDEX, "ＮＩＨＡＯ");
-        assert!(
-            hits.iter().any(|h| h.doc_id == DOC_CN),
-            "expected full-width pinyin query to hit, got {:?}",
-            hits.iter()
-                .map(|h| (&h.doc_id, &h.matched_terms))
-                .collect::<Vec<_>>()
-        );
-        let matched = hits.iter().find(|h| h.doc_id == DOC_CN).and_then(|h| {
-            h.matched_terms
-                .iter()
-                .find(|t| t.domain == TermDomain::PinyinFull)
-        });
-        assert!(
-            matched.is_some(),
-            "expected matched pinyin full term, got {:?}",
-            hits.iter()
-                .find(|h| h.doc_id == DOC_CN)
-                .map(|h| h.matched_terms.clone())
-        );
-    }
-
-    #[test]
-    fn short_pinyin_fuzzy_hits() {
-        let mut index = InMemoryIndex::default();
-        index.add_doc(INDEX, DOC_CN, "你好", true);
-
-        // Missing one character should still fuzzy match via pinyin domain.
-        let hits = index.search_hits(INDEX, "niha");
-        assert!(
-            hits.iter().any(|h| h.doc_id == DOC_CN),
-            "expected fuzzy pinyin hit for short query, got {:?}",
-            hits.iter()
-                .map(|h| (&h.doc_id, &h.matched_terms))
-                .collect::<Vec<_>>()
-        );
-        let matched = hits.iter().find(|h| h.doc_id == DOC_CN).and_then(|h| {
-            h.matched_terms
-                .iter()
-                .find(|t| matches!(t.domain, TermDomain::PinyinFull))
-        });
-        assert!(
-            matched.is_some(),
-            "expected matched pinyin term, got {:?}",
-            hits.iter()
-                .find(|h| h.doc_id == DOC_CN)
-                .map(|h| h.matched_terms.clone())
-        );
-    }
-
-    #[test]
-    fn non_ascii_auto_fuzzy_fallback() {
-        let mut index = InMemoryIndex::default();
-        index.add_doc(INDEX, DOC_CN, "北京大学", true);
-
-        // Typo on the last character should still match via non-ASCII fuzzy fallback.
-        let hits = index.search_hits(INDEX, "北景大学");
-        assert!(
-            hits.iter().any(|h| h.doc_id == DOC_CN),
-            "expected non-ascii fuzzy fallback to hit, got {:?}",
-            hits.iter()
-                .map(|h| (&h.doc_id, &h.matched_terms))
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn mixed_script_query_hits_all_tokens() {
-        let mut index = InMemoryIndex::default();
-        index.add_doc(INDEX, DOC_CN, "hello 世界", true);
-
-        let hits = index.search_hits(INDEX, "hello 世界");
-        assert!(
-            hits.iter().any(|h| h.doc_id == DOC_CN),
-            "expected mixed-script query to hit doc, got {:?}",
-            hits.iter()
-                .map(|h| (&h.doc_id, &h.matched_terms))
-                .collect::<Vec<_>>()
-        );
-        let matched = hits
-            .iter()
-            .find(|h| h.doc_id == DOC_CN)
-            .map(|h| h.matched_terms.clone())
-            .unwrap_or_default();
-        assert!(
-            matched
-                .iter()
-                .any(|t| t.term == "hello" && t.domain == TermDomain::Original),
-            "expected matched original term hello, got {:?}",
-            matched
-        );
-        assert!(
-            matched.iter().any(|t| t.term == "世界"),
-            "expected matched CJK term 世界, got {:?}",
-            matched
-        );
-    }
-
-    #[test]
-    fn chinese_oov_fuzzy_recall() {
-        let mut index = InMemoryIndex::default();
-        index.add_doc(INDEX, DOC_CN, "明博", true);
-
-        // Typo on the second char should still recall via non-ASCII fuzzy fallback.
-        let hits = index.search_hits(INDEX, "明搏");
-        assert!(
-            hits.iter().any(|h| h.doc_id == DOC_CN),
-            "expected OOV chinese fuzzy to hit, got {:?}",
-            hits.iter()
-                .map(|h| (&h.doc_id, &h.matched_terms))
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn load_snapshot_restores_domains_and_lengths() {
-        let mut index = InMemoryIndex::default();
-        index.add_doc(INDEX, DOC_CN, "你好世界", true);
-
-        let snapshot = index
-            .get_snapshot_data(INDEX)
-            .expect("snapshot should exist");
-        let expected_total_len = snapshot.total_len;
-        let expected_domain_len = snapshot.domain_total_len.get(TermDomain::Original);
-
-        let mut restored = InMemoryIndex::default();
-        restored.load_snapshot(INDEX, snapshot);
-
-        let hits = restored.search_hits(INDEX, "nihap");
-        assert!(
-            hits.iter().any(|hit| hit.doc_id == DOC_CN),
-            "expected restored index to serve pinyin fuzzy hits"
-        );
-        let restored_state = restored
-            .indexes
-            .get(INDEX)
-            .expect("restored index state should exist");
-        assert_eq!(restored_state.total_len, expected_total_len);
+        let first = index.search(&query, options.clone()).unwrap();
+        assert_eq!(first.total, 2);
+        assert_eq!(first.hits[0].id, "a");
+        assert!(!first.hits[0].highlights.is_empty());
+        let mut second_options = options;
+        second_options.after = Some(first.hits[0].sort_values.clone());
         assert_eq!(
-            restored_state.domain_total_len.get(TermDomain::Original),
-            expected_domain_len
+            ids(index.search(&query, second_options).unwrap()),
+            vec!["b"]
         );
     }
 
     #[test]
-    fn has_unpersisted_changes_tracks_dirty_and_deleted() {
-        let mut index = InMemoryIndex::default();
-        assert!(!index.has_unpersisted_changes(None));
-
-        index.add_doc(INDEX, DOC_EN, "pending doc", true);
-        assert!(index.has_unpersisted_changes(Some(INDEX)));
-        assert!(index.has_unpersisted_changes(None));
-
-        index.take_dirty_and_deleted();
-        assert!(!index.has_unpersisted_changes(Some(INDEX)));
-        assert!(!index.has_unpersisted_changes(None));
-
-        index.remove_doc(INDEX, DOC_EN);
-        assert!(index.has_unpersisted_changes(Some(INDEX)));
-        assert!(index.has_unpersisted_changes(None));
-    }
-
-    #[test]
-    fn load_snapshot_clears_pending_flags() {
-        let mut index = InMemoryIndex::default();
-        index.add_doc(INDEX, DOC_EN, "snapshot doc", true);
-
-        let snapshot = index
-            .get_snapshot_data(INDEX)
-            .expect("snapshot should exist");
-        assert!(index.has_unpersisted_changes(Some(INDEX)));
-
-        index.load_snapshot(INDEX, snapshot);
-        assert!(
-            !index.has_unpersisted_changes(Some(INDEX)),
-            "loading a snapshot should reset pending persistence markers"
-        );
-    }
-
-    #[test]
-    fn persist_if_dirty_skips_when_clean() {
-        let mut index = InMemoryIndex::default();
-        let mut called = false;
-
-        let persisted = index
-            .persist_if_dirty(INDEX, |_snapshot| -> Result<(), ()> {
-                called = true;
-                Ok(())
-            })
+    fn mutation_batch_aggregation_and_checkpoint_contract() {
+        let fixture = fixture(PositionEncoding::Bytes);
+        let schema = fixture.schema.clone();
+        let mut index = MemoryIndex::new(fixture.schema.clone());
+        index
+            .apply_batch(vec![
+                Mutation::Upsert(document(&fixture, "a", "w1", "search", 1)),
+                Mutation::Upsert(document(&fixture, "b", "w1", "search", 2)),
+                Mutation::Upsert(document(&fixture, "c", "w2", "other", 3)),
+            ])
             .unwrap();
-
-        assert!(!persisted, "clean index should skip persistence");
-        assert!(!called, "callback should not run when skipped");
-    }
-
-    #[test]
-    fn persist_if_dirty_persists_and_marks_clean_on_success() {
-        let mut index = InMemoryIndex::default();
-        index.add_doc(INDEX, DOC_EN, "persist me", true);
-
-        let mut called = false;
-        let persisted = index
-            .persist_if_dirty(INDEX, |snapshot| -> Result<(), ()> {
-                called = true;
-                assert_eq!(snapshot.docs.len(), 1, "snapshot should include doc");
-                Ok(())
-            })
+        assert_eq!(index.change_sequence(), 1);
+        let aggregation = index
+            .aggregate(
+                &Query::All,
+                TermsAggregation {
+                    field: fixture.workspace,
+                    limit: 10,
+                    offset: 0,
+                    top_hits: Some(SearchOptions::new(1)),
+                },
+            )
             .unwrap();
-
-        assert!(persisted, "dirty index should persist");
-        assert!(called, "callback should run on persistence");
-        assert!(
-            !index.has_unpersisted_changes(Some(INDEX)),
-            "successful persist should mark index clean"
+        assert_eq!(aggregation.total, 3);
+        assert_eq!(aggregation.buckets[0].count, 2);
+        assert!(index.delete("b"));
+        assert_eq!(
+            index
+                .search(&Query::All, SearchOptions::new(10))
+                .unwrap()
+                .total,
+            2
         );
+        let checkpoint = index.checkpoint().unwrap();
+        index
+            .upsert(document(&fixture, "d", "w3", "new", 4))
+            .unwrap();
+        index
+            .mark_checkpoint_persisted(checkpoint.sequence)
+            .unwrap();
+        assert!(index.has_unpersisted_changes());
+        let restored = MemoryIndex::from_checkpoint(schema, &checkpoint.bytes).unwrap();
+        assert_eq!(restored.len(), 2);
+        assert!(!restored.has_unpersisted_changes());
+        let mut corrupted = checkpoint.bytes;
+        *corrupted.last_mut().unwrap() ^= 1;
+        assert!(MemoryIndex::from_checkpoint(restored.schema().clone(), &corrupted).is_err());
     }
 
     #[test]
-    fn persist_if_dirty_keeps_pending_on_error() {
-        let mut index = InMemoryIndex::default();
-        index.add_doc(INDEX, DOC_EN, "persist error", true);
+    fn full_upsert_removes_fields_and_invalid_batch_is_atomic() {
+        let fixture = fixture(PositionEncoding::Bytes);
+        let mut index = MemoryIndex::new(fixture.schema.clone());
+        index
+            .upsert(document(&fixture, "a", "w1", "search", 1))
+            .unwrap();
+        let mut replacement = Document::new("a");
+        replacement.add(fixture.content, "other");
+        index.upsert(replacement).unwrap();
+        assert!(
+            index
+                .search(
+                    &Query::term(fixture.workspace, "w1"),
+                    SearchOptions::new(10)
+                )
+                .unwrap()
+                .hits
+                .is_empty()
+        );
+        let sequence = index.change_sequence();
+        let mut invalid = Document::new("bad");
+        invalid.add(fixture.rank, "not-an-i64");
+        assert!(
+            index
+                .apply_batch(vec![
+                    Mutation::Delete("a".into()),
+                    Mutation::Upsert(invalid)
+                ])
+                .is_err()
+        );
+        assert_eq!(index.change_sequence(), sequence);
+        assert_eq!(index.len(), 1);
 
-        let err = index
-            .persist_if_dirty(INDEX, |_snapshot| -> Result<(), &'static str> {
-                Err("boom")
+        let bulk = (0..2_100)
+            .map(|item| {
+                let mut document = Document::new(format!("bulk-{item}"));
+                document.add(fixture.workspace, "bulk");
+                Mutation::Upsert(document)
             })
-            .unwrap_err();
-        assert_eq!(err, "boom");
-        assert!(
-            index.has_unpersisted_changes(Some(INDEX)),
-            "failed persist should leave index dirty"
+            .collect();
+        index.apply_batch(bulk).unwrap();
+        index
+            .apply_batch(
+                (0..1_000)
+                    .map(|item| {
+                        let mut document = Document::new(format!("bulk-{item}"));
+                        document.add(fixture.workspace, "bulk-updated");
+                        Mutation::Upsert(document)
+                    })
+                    .collect(),
+            )
+            .unwrap();
+        let deleted = index
+            .apply_batch(
+                (1_000..2_000)
+                    .map(|item| Mutation::Delete(format!("bulk-{item}")))
+                    .collect(),
+            )
+            .unwrap();
+        assert_eq!(deleted.deleted, 1_000);
+        assert_eq!(
+            index
+                .search(&Query::All, SearchOptions::new(0))
+                .unwrap()
+                .total,
+            1_101
         );
-    }
-
-    #[test]
-    fn fuzzy_msm_filters_insufficient_matches() {
-        let mut index = InMemoryIndex::default();
-        index.add_doc(INDEX, "doc-long", "apple banana", true);
-        index.add_doc(INDEX, "doc-short", "apple", true);
-
-        let hits = index.search_with_mode_hits(INDEX, "applr banaan", SearchMode::Fuzzy);
-        assert!(
-            hits.iter().any(|h| h.doc_id == "doc-long"),
-            "expected fuzzy msm to keep doc with both terms, got {:?}",
-            hits
-        );
-        assert!(
-            hits.iter().all(|h| h.doc_id != "doc-short"),
-            "docs below min_should_match should be filtered out: {:?}",
-            hits
-        );
-    }
-
-    #[test]
-    fn short_cjk_fuzzy_recall_uses_2gram() {
-        let mut index = InMemoryIndex::default();
-        index.add_doc(INDEX, "doc-short-cjk", "方案", true);
-
-        let hits = index.search_hits(INDEX, "方桉");
-        assert!(
-            hits.iter().any(|h| h.doc_id == "doc-short-cjk"),
-            "expected 2-gram fuzzy recall for short CJK tokens, got {:?}",
-            hits
-        );
-    }
-
-    #[test]
-    fn dictionary_load_and_fallback() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("dict.json");
-
-        let mut entries = HashSet::new();
-        entries.insert("こんにちは".to_string());
-        let config = DictionaryConfig {
-            japanese: Some(ScriptDictionary {
-                version: Some("v1".to_string()),
-                entries,
-            }),
-            hangul: None,
-        };
-
-        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
-        let loaded: DictionaryConfig =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).expect("should deserialize");
-
-        let mut index = InMemoryIndex::with_dictionary_config(loaded.clone());
-        index.add_doc(INDEX, DOC_JP, "こんにちは世界", true);
-
-        let hits = index.search_with_mode_hits(INDEX, "こんにちは", SearchMode::Exact);
-        assert!(
-            hits.iter().any(|h| h.doc_id == DOC_JP),
-            "expected dictionary-backed search hit, got {:?}",
-            hits
-        );
-        let mut fallback_index = InMemoryIndex::default();
-        fallback_index.add_doc(INDEX, DOC_JP, "こんにちは世界", true);
-        let fallback_hits =
-            fallback_index.search_with_mode_hits(INDEX, "こんにちは", SearchMode::Exact);
-        assert!(
-            fallback_hits.iter().any(|h| h.doc_id == DOC_JP),
-            "expected fallback tokenization to still recall doc, got {:?}",
-            fallback_hits
-        );
-    }
-
-    #[test]
-    fn id_like_tokens_match_exact() {
-        let mut index = InMemoryIndex::default();
-        let doc_id = "doc-id";
-        let id_like = "IKPeA9Zu9eo_pXlKWVFcf";
-
-        index.add_doc(INDEX, doc_id, id_like, true);
-
-        let hits = index.search_with_mode_hits(INDEX, id_like, SearchMode::Exact);
-        assert!(
-            hits.iter().any(|h| h.doc_id == doc_id),
-            "expected exact search to hit id-like token, got {:?}",
-            hits
-        );
+        index.checkpoint().unwrap();
     }
 }

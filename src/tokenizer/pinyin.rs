@@ -161,12 +161,9 @@ fn build_single_pinyin_variant(chars: &[char]) -> Option<(String, String)> {
     let mut initials = String::new();
 
     for ch in chars {
-        if let Some(py) = ch.to_pinyin() {
-            full.push_str(py.plain());
-            initials.push_str(py.first_letter());
-        } else {
-            return None;
-        }
+        let py = ch.to_pinyin()?;
+        full.push_str(py.plain());
+        initials.push_str(py.first_letter());
     }
 
     Some((full, initials))
